@@ -73,6 +73,52 @@ an editor check should also cover an already open buffer after preparation.
 Record the loaded server command in that editor check to distinguish the new
 binary from a running client that has not been restarted.
 
+## Completion during compilation
+
+`benchmarks/build_completion.py` isolates build-related stalls on a temporary
+copy of a self-contained project. It measures four scenarios: typing `\input`
+without a build (`baseline`), typing immediately after `latex.build` (`start`),
+typing after a save that starts a build (`save`), and a build followed by twenty
+rapid prose edits and `\input`, with automatic editor queries (`rapid`). Typing
+starts 20 ms after the build/save, with 20 ms between edits. Superseded completion
+requests are cancelled; subsequent completion probes run every 50 ms with at most
+one probe outstanding. Every successful completion must contain the expected
+`input` insertion text, and the final typed prefix must complete successfully.
+
+```sh
+python3 benchmarks/build_completion.py /path/to/project \
+  --output target/benchmarks/build-completion.json
+```
+
+The default controlled compiler sleeps for two seconds and produces minimal
+artifacts plus a recorder of local source files. Its wall-clock markers identify
+the actual compiler process interval, separately from `latex/buildStarted`
+(which precedes compiler preparation) and `latex/buildFinished` (which follows
+result publication). This distinguishes build setup, compiler execution and
+result publication. The fake PDF is an artifact freshness fixture, not a PDF
+rendering check. ChkTeX and distribution discovery are disabled.
+
+For an actual compilation, select `--compiler latexmk`; this uses the project's
+copied latexmk configuration and requires a TeX installation. The project must
+use relative, self-contained input/output paths for its builds to stay inside
+the copy. The script excludes existing `build/` outputs. To measure a subsequent
+build after recorder files and dependency state have been populated, use
+`--prime-build`; an unmeasured build finishes in the same server first.
+
+```sh
+python3 benchmarks/build_completion.py /path/to/project \
+  --compiler latexmk --cases start save --prime-build \
+  --output target/benchmarks/build-completion-latexmk.json
+```
+
+JSON includes binary SHA-256, each request's send/receive times, cancellations
+and stale-input errors, completion edits, build notifications and compiler
+markers. Latency summaries exclude cancelled/stale responses; they include
+both prefix changes and repeated probes, so inspect `final_typing_ms` and the
+timeline rather than relying on the overall median to find a brief stall.
+These are protocol measurements; candidate menu timing requires a separate
+Neovim check. Each case starts a new server; use multiple rounds for variability.
+
 ## Generated editing sessions
 
 By default, three sizes of deterministically generated projects are measured: small is 1 chapter and 16 sections per chapter; medium is 4 chapters and 32 sections per chapter; large is 8 chapters and 64 sections per chapter. Each project contains the main document, chapter files and BibTeX database. The text contains Chinese, emoji, mathematical environment, user macros, cross-file labels and citations. Projects are all below the default index budget; the test rejects index truncation.
