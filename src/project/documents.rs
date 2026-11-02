@@ -33,6 +33,10 @@ pub type Iter<'a> = std::iter::Map<
 >;
 
 impl Documents {
+    pub(crate) fn weak_revision(&self, uri: &Url) -> Option<Weak<Document>> {
+        self.0.get(uri).map(Arc::downgrade)
+    }
+
     pub(crate) fn weak_revisions(&self) -> Vec<(Url, Weak<Document>)> {
         self.revisions().0
     }

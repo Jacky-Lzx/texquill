@@ -1,4 +1,4 @@
-//! One synchronous analysis owns its caches, observed files and cancellation.
+//! Request-local context with revision-checked, connection-owned pure analyses.
 use crate::{diagnostics::diagnostic_inputs::Files, project::source_inputs, symbols::query_cache};
 use std::{cell::RefCell, path::Path, rc::Rc, sync::Arc};
 
@@ -9,6 +9,8 @@ pub(crate) struct AnalysisContext {
     observed: Option<Rc<RefCell<Files>>>,
     cancellation: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
     cache_enabled: bool,
+    persistent_indexes: bool,
+    pub(crate) binding: Option<Rc<crate::analysis_cache::Binding>>,
 }
 
 // Compatibility bridge for synchronous readers. The actual state is owned by
@@ -35,9 +37,44 @@ impl AnalysisContext {
             symbols: RefCell::default(),
             sources: RefCell::default(),
             observed: parent.as_ref().and_then(|parent| parent.observed.clone()),
-            cancellation: parent.and_then(|parent| parent.cancellation.clone()),
+            cancellation: parent
+                .as_ref()
+                .and_then(|parent| parent.cancellation.clone()),
             cache_enabled: true,
+            binding: parent.as_ref().and_then(|parent| parent.binding.clone()),
+            persistent_indexes: parent
+                .as_ref()
+                .is_some_and(|parent| parent.persistent_indexes),
         })
+    }
+
+    pub(crate) fn for_workspace(
+        workspace: &crate::project::workspace::Workspace,
+        epoch: u64,
+        revision: u64,
+        cache: Arc<crate::analysis_cache::Cache>,
+    ) -> Rc<Self> {
+        let mut context = Self::new();
+        Rc::get_mut(&mut context).unwrap().binding = Some(Rc::new(
+            crate::analysis_cache::Binding::new(workspace, epoch, revision, cache),
+        ));
+        Rc::get_mut(&mut context).unwrap().persistent_indexes = true;
+        context
+    }
+
+    pub(crate) fn observing_files(&self) -> bool {
+        self.observed.is_some()
+    }
+
+    pub(crate) fn persistent_indexes(&self) -> bool {
+        self.persistent_indexes
+    }
+
+    pub(crate) fn source_document(
+        source: &str,
+        parsed: &crate::parser::syntax::Syntax,
+    ) -> Option<std::sync::Weak<crate::project::workspace::Document>> {
+        Self::current()?.binding.as_ref()?.document(source, parsed)
     }
 
     pub(crate) fn cancellable(cancelled: impl Fn() -> bool + Send + Sync + 'static) -> Rc<Self> {
@@ -51,10 +88,11 @@ impl AnalysisContext {
         context
     }
 
-    /// Mutating work may share pure text reads, but never workspace indexes.
+    /// Mutating work may share certified document/grammar facts, never workspace indexes.
     pub(crate) fn lexical() -> Rc<Self> {
         let mut context = Self::new();
         Rc::get_mut(&mut context).unwrap().cache_enabled = false;
+        Rc::get_mut(&mut context).unwrap().persistent_indexes = false;
         context
     }
 

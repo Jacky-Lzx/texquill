@@ -116,11 +116,21 @@ impl Completion {
                 )
             };
             let cache = self.cache.clone();
+            let analysis = queries.analyses.clone();
             let result = queries
                 .run_background(move |cancel| {
                     crate::analysis::AnalysisContext::new().run(|context| {
                         let mut snapshot = snapshot;
-                        let changed = snapshot.refresh_pending_dependencies();
+                        let updates = crate::analysis::AnalysisContext::for_workspace(
+                            &snapshot,
+                            epoch,
+                            revision,
+                            analysis.clone(),
+                        );
+                        let changed = updates.run(|_| snapshot.refresh_pending_dependencies());
+                        let shared = crate::analysis::AnalysisContext::for_workspace(
+                            &snapshot, epoch, revision, analysis,
+                        );
                         let mut prepared = Vec::new();
                         for uri in &origins {
                             let Some(doc) = snapshot.documents.get(uri) else {
@@ -130,8 +140,8 @@ impl Completion {
                             if doc.version.is_some()
                                 && !cache.lock().unwrap().covers(&snapshot, epoch, uri)
                             {
-                                if let Some(entry) = crate::analysis::AnalysisContext::new()
-                                    .run(|_| Prepared::build(&snapshot, uri, epoch))
+                                if let Some(entry) =
+                                    shared.run(|_| Prepared::build(&snapshot, uri, epoch))
                                 {
                                     prepared.push(entry);
                                 }

@@ -146,10 +146,23 @@ impl Backend {
         &self,
         query: impl FnOnce(&Workspace) -> T + Send + 'static,
     ) -> Result<T> {
-        let workspace = self.workspace.read().await.clone();
+        let (workspace, epoch, revision) = {
+            let inputs = self.workspace.read().await;
+            (
+                inputs.clone(),
+                self.workspace.completion_epoch(),
+                self.workspace.revision(),
+            )
+        };
+        let analysis = self.queries.analyses.clone();
         dispatch::release();
         self.queries
-            .run(move |_| Ok(crate::analysis::AnalysisContext::new().run(|_| query(&workspace))))
+            .run(move |_| {
+                Ok(crate::analysis::AnalysisContext::for_workspace(
+                    &workspace, epoch, revision, analysis,
+                )
+                .run(|_| query(&workspace)))
+            })
             .await
     }
 
@@ -164,11 +177,16 @@ impl Backend {
             return Err(content_modified());
         }
         self.wait_prepared_inputs().await?;
-        let (workspace, revision) = {
+        let (workspace, revision, epoch) = {
             let workspace = self.workspace.read().await;
-            (workspace.clone(), self.workspace.revision())
+            (
+                workspace.clone(),
+                self.workspace.revision(),
+                self.workspace.completion_epoch(),
+            )
         };
         let revisions = self.workspace.clone();
+        let analysis = self.queries.analyses.clone();
         dispatch::release();
         let work = self.queries.run_background(move |_| {
             let context_revisions = revisions.clone();
@@ -178,8 +196,12 @@ impl Backend {
             if revisions.revision() != revision {
                 return Err(content_modified());
             }
-            let result =
-                context.run(|_| crate::analysis::AnalysisContext::new().run(|_| query(&workspace)));
+            let result = context.run(|_| {
+                crate::analysis::AnalysisContext::for_workspace(
+                    &workspace, epoch, revision, analysis,
+                )
+                .run(|_| query(&workspace))
+            });
             if revisions.revision() != revision {
                 return Err(content_modified());
             }
@@ -1003,7 +1025,13 @@ impl Backend {
             return;
         }
         if workspace.has_pending_dependencies() {
-            workspace.refresh_pending_dependencies();
+            let context = crate::analysis::AnalysisContext::for_workspace(
+                &workspace,
+                self.workspace.completion_epoch(),
+                self.workspace.revision(),
+                self.queries.analyses.clone(),
+            );
+            context.run(|_| workspace.refresh_pending_dependencies());
         }
         drop(workspace);
         if self.pending_change_publish.swap(false, Ordering::SeqCst) {

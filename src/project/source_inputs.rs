@@ -80,12 +80,90 @@ impl Index {
         if let Some(index) = context.sources.borrow().indexes.get(&key).cloned() {
             return index;
         }
-        let index = Self::build(workspace, root);
+        let index = if let Some(binding) = context
+            .binding
+            .as_ref()
+            .filter(|_| context.persistent_indexes() && !context.observing_files())
+        {
+            if let Some(index) = binding.index(workspace, root) {
+                index
+            } else {
+                let (index, files) = crate::diagnostics::diagnostic_inputs::Files::capture(|| {
+                    AnalysisContext::new().run(|_| Self::build(workspace, root))
+                });
+                if !context.cancelled() {
+                    binding.insert_index(workspace, root, &index, files);
+                }
+                index
+            }
+        } else {
+            Self::build(workspace, root)
+        };
         let mut query = context.sources.borrow_mut();
         if query.indexes.len() < 4 {
             query.indexes.insert(key, index.clone());
         }
         index
+    }
+
+    pub(crate) fn cache_bytes(&self) -> usize {
+        let calls = [
+            &self.calls,
+            &self.loaders,
+            &self.forwarders,
+            &self.resources,
+            &self.resource_references,
+            &self.selectors,
+            &self.checks,
+        ];
+        std::mem::size_of::<Self>()
+            + calls
+                .into_iter()
+                .flat_map(|calls| calls.iter())
+                .map(|(uri, calls)| {
+                    uri.as_str().len()
+                        + 256
+                        + calls.capacity() * std::mem::size_of::<SourceCall>()
+                        + calls
+                            .iter()
+                            .map(|call| {
+                                call.command.name.capacity()
+                                    + call
+                                        .command
+                                        .argument
+                                        .as_ref()
+                                        .map_or(0, |argument| argument.value.capacity() + 128)
+                            })
+                            .sum::<usize>()
+                })
+                .sum::<usize>()
+            + self
+                .context
+                .iter()
+                .map(|uri| uri.as_str().len() + 128)
+                .sum::<usize>()
+            + self
+                .section_labels
+                .iter()
+                .map(|label| label.capacity() + 128)
+                .sum::<usize>()
+            + self
+                .literal
+                .iter()
+                .flat_map(|map| map.iter())
+                .map(|(uri, entries)| {
+                    uri.as_str().len()
+                        + 256
+                        + entries
+                            .iter()
+                            .map(|uri| uri.as_str().len() + 128)
+                            .sum::<usize>()
+                })
+                .sum::<usize>()
+            + self
+                .signatures
+                .as_ref()
+                .map_or(0, |(_, signatures)| signatures.cache_bytes())
     }
 
     fn build(workspace: &Workspace, root: &Url) -> Self {

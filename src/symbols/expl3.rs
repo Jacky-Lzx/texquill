@@ -101,10 +101,23 @@ fn variable_declaration(name: &str) -> bool {
         || (operation == "const" && matches!(suffix, "Nn" | "Nx" | "Ne")))
 }
 
+#[derive(Clone)]
 pub(crate) struct Analysis {
     pub entries: Vec<Occurrence>,
     pub bodies: Vec<std::ops::Range<usize>>,
     pub data: Vec<std::ops::Range<usize>>,
+}
+impl Analysis {
+    pub(crate) fn cache_bytes(&self) -> usize {
+        self.entries.capacity() * std::mem::size_of::<Occurrence>()
+            + self
+                .entries
+                .iter()
+                .map(|entry| entry.name.capacity() + entry.detail.capacity())
+                .sum::<usize>()
+            + (self.bodies.capacity() + self.data.capacity())
+                * std::mem::size_of::<std::ops::Range<usize>>()
+    }
 }
 pub(crate) fn occurrences(doc: &Document) -> Analysis {
     analyze(doc, false)
@@ -113,6 +126,27 @@ pub(crate) fn math_data_spans(doc: &Document) -> Vec<std::ops::Range<usize>> {
     analyze(doc, true).data
 }
 fn analyze(doc: &Document, include_data: bool) -> Analysis {
+    if let Some((context, binding, document)) = crate::analysis::AnalysisContext::current()
+        .and_then(|context| {
+            let binding = context.binding.clone()?;
+            let document = binding.document(&doc.text.source, &doc.syntax)?;
+            Some((context, binding, document))
+        })
+    {
+        if let Some(value) = binding.cache.code(&document, include_data) {
+            return value;
+        }
+        let value = compute_analysis(doc, include_data);
+        if !context.cancelled() {
+            binding.cache.insert_code(document, include_data, &value);
+        }
+        value
+    } else {
+        compute_analysis(doc, include_data)
+    }
+}
+
+fn compute_analysis(doc: &Document, include_data: bool) -> Analysis {
     if doc.kind != DocumentKind::Latex {
         return Analysis {
             entries: vec![],

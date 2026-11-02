@@ -42,7 +42,7 @@ fn literal(name: &str) -> bool {
     syntax::is_static_key(name) && name != "." && !name.starts_with("./")
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone, Default, PartialEq, Eq)]
 pub(crate) struct Arities {
     declared: BTreeMap<String, Option<usize>>,
     one_time: BTreeSet<String>,

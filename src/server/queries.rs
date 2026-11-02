@@ -8,6 +8,7 @@ use tokio::sync::{Notify, Semaphore};
 
 #[derive(Clone)]
 pub(crate) struct Queries {
+    pub(crate) analyses: Arc<crate::analysis_cache::Cache>,
     slots: Arc<Semaphore>,
     background: Arc<Semaphore>,
     closing: Arc<AtomicBool>,
@@ -57,6 +58,7 @@ impl Default for Queries {
 impl Queries {
     fn new(limit: usize) -> Self {
         Self {
+            analyses: Arc::default(),
             slots: Arc::new(Semaphore::new(limit)),
             // Background work must leave capacity for completion/signatures.
             background: Arc::new(Semaphore::new(limit.saturating_sub(1).max(1))),

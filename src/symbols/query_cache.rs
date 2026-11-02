@@ -1,4 +1,4 @@
-//! Owned symbol analyses shared only during one immutable workspace query.
+//! Query-local symbol indexes and revision-checked shared command grammars.
 use super::{label_declarations, named_references};
 use crate::{
     analysis::AnalysisContext,
@@ -35,14 +35,14 @@ fn shared<K: Ord, V>(
     context: &AnalysisContext,
     key: K,
     select: impl Fn(&mut Cache) -> &mut BTreeMap<K, Arc<V>>,
-    build: impl FnOnce() -> V,
+    build: impl FnOnce() -> Arc<V>,
     bytes: impl FnOnce(&V) -> usize,
 ) -> Arc<V> {
     if let Some(index) = select(&mut context.symbols.borrow_mut()).get(&key).cloned() {
         return index;
     }
     // Recursive analyses must not retain a cache borrow while computing.
-    let index = Arc::new(build());
+    let index = build();
     let mut cache = context.symbols.borrow_mut();
     let bytes = bytes(&index);
     if select(&mut cache).len() < MAX_ENTRIES && bytes <= MAX_BYTES - cache.bytes {
@@ -64,7 +64,7 @@ pub(crate) fn named(
         &context,
         (workspace as *const Workspace as usize, origin.clone()),
         |cache| &mut cache.named,
-        build,
+        || Arc::new(build()),
         |index| {
             index
                 .cache_bytes()
@@ -89,7 +89,7 @@ pub(crate) fn labels(
         &context,
         (workspace as *const Workspace as usize, scope.clone()),
         |cache| &mut cache.labels,
-        build,
+        || Arc::new(build()),
         |index| index.cache_bytes().saturating_add(key_bytes),
     )
 }
@@ -110,13 +110,38 @@ pub(crate) fn signatures(
         &context,
         (workspace as *const Workspace as usize, scope.clone()),
         |cache| &mut cache.signatures,
-        build,
+        || persistent_signatures(&context, workspace, scope, false, build),
         |signatures| signatures.cache_bytes().saturating_add(key_bytes),
     )
 }
 
+fn persistent_signatures(
+    context: &AnalysisContext,
+    workspace: &Workspace,
+    scope: &BTreeSet<Url>,
+    source: bool,
+    build: impl FnOnce() -> CommandSignatures<'static>,
+) -> Arc<CommandSignatures<'static>> {
+    if let Some(value) = context
+        .binding
+        .as_ref()
+        .and_then(|binding| binding.cache.grammar(workspace, scope, source))
+    {
+        return value;
+    }
+    let value = build();
+    if let Some(binding) = context.binding.as_ref().filter(|_| !context.cancelled()) {
+        binding
+            .cache
+            .intern(workspace, scope, source, value, binding.revision)
+    } else {
+        Arc::new(value)
+    }
+}
+
 /// Use the same ordered LaTeX sources for every analysis of a project scope.
-/// Outside an immutable query keep borrowed keys; retained analyses own theirs.
+/// Unbound callers keep borrowed keys; retained analyses own theirs. Pure
+/// grammars can also be reused between mutations after checking every source.
 pub(crate) fn project_signatures<'a>(
     workspace: &'a Workspace,
     scope: &BTreeSet<Url>,
@@ -131,14 +156,21 @@ pub(crate) fn project_signatures<'a>(
         )
     };
     if AnalysisContext::current_query().is_none() {
-        Arc::new(build())
+        if let Some(context) =
+            AnalysisContext::current().filter(|context| context.binding.is_some())
+        {
+            persistent_signatures(&context, workspace, scope, false, || build().into_owned())
+        } else {
+            Arc::new(build())
+        }
     } else {
         signatures(workspace, scope, || build().into_owned())
     }
 }
 
 /// Source execution uses a filtered grammar, distinct from editing signatures.
-/// Reuse it only while the workspace is immutable, under the same byte budget.
+/// Retained grammars certify each source revision; mutable updates never reuse
+/// a workspace index just because one of these pure grammars still agrees.
 pub(crate) fn source_signatures(
     workspace: &Workspace,
     scope: &BTreeSet<Url>,
@@ -152,18 +184,17 @@ pub(crate) fn source_signatures(
                 .map(|doc| (doc.text.source.as_str(), &doc.syntax)),
         )
     };
-    let Some(context) = AnalysisContext::current_query() else {
+    let Some(context) = AnalysisContext::current_query()
+        .or_else(|| AnalysisContext::current().filter(|context| context.binding.is_some()))
+    else {
         return Arc::new(build().into_owned());
     };
     let key_bytes = scope
         .iter()
         .map(|uri| uri.as_str().len() + 64)
         .sum::<usize>();
-    shared(
-        &context,
-        (workspace as *const Workspace as usize, scope.clone()),
-        |cache| &mut cache.source_signatures,
-        || {
+    let build = || {
+        persistent_signatures(&context, workspace, scope, true, || {
             let preliminary = project_signatures(workspace, scope);
             CommandSignatures::source_context_with(
                 scope
@@ -174,7 +205,16 @@ pub(crate) fn source_signatures(
                 &preliminary,
             )
             .into_owned()
-        },
+        })
+    };
+    if AnalysisContext::current_query().is_none() {
+        return build();
+    }
+    shared(
+        &context,
+        (workspace as *const Workspace as usize, scope.clone()),
+        |cache| &mut cache.source_signatures,
+        build,
         |signatures| signatures.cache_bytes().saturating_add(key_bytes),
     )
 }
@@ -410,7 +450,7 @@ mod tests {
                 &AnalysisContext::current_query().unwrap(),
                 (0, Url::parse("untitled:full").unwrap()),
                 |cache| &mut cache.named,
-                named_references::Index::default,
+                || Arc::new(named_references::Index::default()),
                 |_| MAX_BYTES,
             );
             let first = project_signatures(&workspace, &scope);
@@ -488,7 +528,7 @@ mod tests {
                     &AnalysisContext::current_query().unwrap(),
                     (0, Url::parse(&format!("untitled:{key}")).unwrap()),
                     |cache| &mut cache.named,
-                    named_references::Index::default,
+                    || Arc::new(named_references::Index::default()),
                     |_| bytes,
                 )
             };

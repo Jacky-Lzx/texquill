@@ -143,6 +143,7 @@ impl InlineTokenization {
             signatures.inline_copy_operands(parsed);
             self.signatures = Some(CommandSignatures {
                 common_grammars: Default::default(),
+                memo: Default::default(),
                 local: signatures
                     .local
                     .into_iter()

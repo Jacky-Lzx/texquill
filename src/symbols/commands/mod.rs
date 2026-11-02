@@ -7,6 +7,7 @@ use crate::{
     },
 };
 use lsp_types::Url;
+mod memo;
 mod tokenization;
 pub(crate) use tokenization::InlineTokenization;
 
@@ -1087,11 +1088,12 @@ pub(crate) struct CommandSignatures<'a> {
     identity_parameters: BTreeSet<String>,
     hook_arities: crate::symbols::hook_arguments::Arities,
     common_grammars: std::sync::OnceLock<BTreeMap<String, Option<LiteralOperands>>>,
+    memo: memo::Memo,
 }
 
 /// Possible declarations only exclude literal edits; they never establish a
 /// unique command meaning for navigation, source loading or signature help.
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 enum LiteralOperands {
     Signature(Signature),
     Tex(TexOperands),
@@ -1220,6 +1222,16 @@ fn grammar_literal_bytes(value: &LiteralOperands) -> usize {
 }
 
 impl<'a> CommandSignatures<'a> {
+    pub(crate) fn same_meanings(&self, other: &Self) -> bool {
+        self.local == other.local
+            && self.tex_operands == other.tex_operands
+            && self.literal_operands == other.literal_operands
+            && self.unverified_names == other.unverified_names
+            && self.detokenize_boundary_known == other.detokenize_boundary_known
+            && self.identity_parameters == other.identity_parameters
+            && self.hook_arities == other.hook_arities
+    }
+
     /// Retain an analysis within an immutable query without borrowing sources.
     pub(crate) fn into_owned(self) -> CommandSignatures<'static> {
         CommandSignatures {
@@ -1247,6 +1259,7 @@ impl<'a> CommandSignatures<'a> {
             identity_parameters: self.identity_parameters,
             hook_arities: self.hook_arities,
             common_grammars: self.common_grammars,
+            memo: self.memo,
         }
     }
 
@@ -1264,6 +1277,7 @@ impl<'a> CommandSignatures<'a> {
         // the same byte budget as the declarations that produced it.
         let common = self.common_parameter_grammars();
         std::mem::size_of::<Self>()
+            + memo::MAX_BYTES
             + tree(common)
             + common
                 .iter()
@@ -1320,6 +1334,7 @@ impl<'a> CommandSignatures<'a> {
         documents: impl IntoIterator<Item = (&'a str, &'a syntax::Syntax)>,
     ) -> Self {
         self.common_grammars = Default::default();
+        self.memo = Default::default();
         for (name, operands) in Self::new(documents).literal_operands {
             self.literal_operands
                 .entry(name)
@@ -1635,6 +1650,7 @@ impl<'a> CommandSignatures<'a> {
             identity_parameters,
             hook_arities: crate::symbols::hook_arguments::Arities::default(),
             common_grammars: Default::default(),
+            memo: Default::default(),
         };
         // Deferred or forwarded providers can install an unseen definition.
         // Proven displayed file commands cannot execute such a provider.
@@ -2367,6 +2383,29 @@ impl<'a> CommandSignatures<'a> {
         positions: &BTreeSet<usize>,
         builtins: &[&str],
     ) -> Vec<SourceCall> {
+        let doc = crate::analysis::AnalysisContext::source_document(source, parsed);
+        if let Some(calls) = doc
+            .as_ref()
+            .and_then(|doc| self.memo.get_calls(doc, builtins, positions))
+        {
+            return calls;
+        }
+        let calls = self.compute_indirect_file_invocations(source, parsed, positions, builtins);
+        if let Some(doc) = doc.filter(|_| {
+            !crate::analysis::AnalysisContext::current().is_some_and(|ctx| ctx.cancelled())
+        }) {
+            self.memo.insert_calls(doc, builtins, positions, &calls);
+        }
+        calls
+    }
+
+    fn compute_indirect_file_invocations(
+        &self,
+        source: &str,
+        parsed: &syntax::Syntax,
+        positions: &BTreeSet<usize>,
+        builtins: &[&str],
+    ) -> Vec<SourceCall> {
         let aliased = self
             .local
             .values()
@@ -2452,6 +2491,17 @@ impl<'a> CommandSignatures<'a> {
     /// A bibliography trace can independently prove immediate native notes.
     /// Other immediate analyses continue to treat their code as deferred.
     pub(crate) fn initialized_source_command_positions(
+        &self,
+        source: &str,
+        parsed: &syntax::Syntax,
+        immediate_notes: bool,
+    ) -> BTreeSet<usize> {
+        self.memoized_tokens(source, parsed, 16 | u8::from(immediate_notes), || {
+            self.compute_initialized_source_command_positions(source, parsed, immediate_notes)
+        })
+    }
+
+    fn compute_initialized_source_command_positions(
         &self,
         source: &str,
         parsed: &syntax::Syntax,
@@ -2711,6 +2761,17 @@ impl<'a> CommandSignatures<'a> {
         parsed: &syntax::Syntax,
         parameters: ParameterRead,
     ) -> BTreeSet<usize> {
+        self.memoized_tokens(source, parsed, parameters as u8 | 32, || {
+            self.compute_editing_tokens(source, parsed, parameters)
+        })
+    }
+
+    fn compute_editing_tokens(
+        &self,
+        source: &str,
+        parsed: &syntax::Syntax,
+        parameters: ParameterRead,
+    ) -> BTreeSet<usize> {
         if !parsed
             .definitions
             .iter()
@@ -2728,6 +2789,7 @@ impl<'a> CommandSignatures<'a> {
             identity_parameters: self.identity_parameters.clone(),
             hook_arities: self.hook_arities.clone(),
             common_grammars: Default::default(),
+            memo: Default::default(),
         };
         shapes.inline_copy_operands(parsed);
         shapes.argument_tokens_with_literal(source, parsed, None, false, false, parameters)
@@ -2829,6 +2891,7 @@ impl<'a> CommandSignatures<'a> {
     /// captured grammar. Pure forwarders retain their late-bound target.
     fn inline_copy_operands(&mut self, parsed: &syntax::Syntax) {
         self.common_grammars = Default::default();
+        self.memo = Default::default();
         let mut entries = BTreeMap::new();
         for entry in parsed.definitions.iter().chain(&parsed.environments) {
             entries
@@ -3287,7 +3350,53 @@ impl<'a> CommandSignatures<'a> {
         shapes
     }
 
+    fn memoized_tokens(
+        &self,
+        source: &str,
+        parsed: &syntax::Syntax,
+        mode: u8,
+        compute: impl FnOnce() -> BTreeSet<usize>,
+    ) -> BTreeSet<usize> {
+        let doc = crate::analysis::AnalysisContext::source_document(source, parsed);
+        if let Some(tokens) = doc.as_ref().and_then(|doc| self.memo.get(doc, mode)) {
+            return tokens;
+        }
+        let result = compute();
+        if let Some(doc) = doc.filter(|_| {
+            !crate::analysis::AnalysisContext::current().is_some_and(|context| context.cancelled())
+        }) {
+            self.memo.insert(doc, mode, &result);
+        }
+        result
+    }
+
     fn argument_tokens_with_literal(
+        &self,
+        source: &str,
+        parsed: &syntax::Syntax,
+        literal: Option<usize>,
+        declared_only: bool,
+        known_only: bool,
+        parameters: ParameterRead,
+    ) -> BTreeSet<usize> {
+        let compute = || {
+            self.compute_argument_tokens_with_literal(
+                source,
+                parsed,
+                literal,
+                declared_only,
+                known_only,
+                parameters,
+            )
+        };
+        if literal.is_some() {
+            return compute();
+        }
+        let mode = parameters as u8 | (u8::from(declared_only) << 6) | (u8::from(known_only) << 7);
+        self.memoized_tokens(source, parsed, mode, compute)
+    }
+
+    fn compute_argument_tokens_with_literal(
         &self,
         source: &str,
         parsed: &syntax::Syntax,
