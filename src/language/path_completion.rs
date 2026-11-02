@@ -46,7 +46,24 @@ pub fn complete(
     command: &str,
     span: Range<usize>,
 ) -> Vec<CompletionItem> {
-    complete_with_argument(workspace, uri, command, span, None, None)
+    complete_with_argument(workspace, uri, command, span, None, None, None)
+}
+
+/// The caller has certified the native input meaning and its compilation root.
+pub(crate) fn complete_prepared_input(
+    workspace: &Workspace,
+    uri: &Url,
+    span: Range<usize>,
+) -> Vec<CompletionItem> {
+    complete_with_argument(
+        workspace,
+        uri,
+        "input",
+        span,
+        None,
+        None,
+        Some(vec![uri.clone()]),
+    )
 }
 
 pub(crate) fn complete_source(
@@ -93,6 +110,7 @@ pub(crate) fn complete_source(
         span,
         argument.as_deref(),
         Some(command.span.start),
+        None,
     )
 }
 
@@ -103,6 +121,7 @@ fn complete_with_argument(
     span: Range<usize>,
     argument: Option<&syntax::Argument>,
     call_start: Option<usize>,
+    prepared_roots: Option<Vec<Url>>,
 ) -> Vec<CompletionItem> {
     let Some(doc) = workspace.documents.get(uri) else {
         return vec![];
@@ -172,10 +191,12 @@ fn complete_with_argument(
         return vec![];
     };
     let filter_prefix = raw_prefix.rsplit('\n').next().unwrap_or(raw_prefix);
-    let roots = workspace
-        .root_document(uri)
-        .map(|root| vec![root])
-        .unwrap_or_else(|_| workspace.source_roots(uri));
+    let roots = prepared_roots.unwrap_or_else(|| {
+        workspace
+            .root_document(uri)
+            .map(|root| vec![root])
+            .unwrap_or_else(|_| workspace.source_roots(uri))
+    });
     let raw_resource_insertion = std::cell::OnceCell::new();
     if syntax::code_input_command(command)
         && !doc.syntax.commands.iter().any(|candidate| {

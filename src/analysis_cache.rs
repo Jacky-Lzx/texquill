@@ -22,6 +22,11 @@ const MAX_INDEXES: usize = 4;
 const MAX_INDEX_BYTES: usize = 8 * 1024 * 1024;
 const MAX_CODE_TABLES: usize = 64;
 const MAX_CODE_BYTES: usize = 4 * 1024 * 1024;
+const MAX_DECLARATIONS: usize = 64;
+const MAX_DECLARATION_BYTES: usize = 8 * 1024 * 1024;
+const MAX_PREFIXES: usize = 16;
+const MAX_PREFIX_BYTES: usize = 16 * 1024 * 1024;
+pub(crate) type PrefixInputs = Vec<(Weak<Document>, usize)>;
 
 type Inputs = Vec<(Url, Option<Weak<Document>>)>;
 struct Proof {
@@ -50,11 +55,23 @@ struct Code {
     value: crate::symbols::expl3::Analysis,
     bytes: usize,
 }
+struct Declarations {
+    document: Weak<Document>,
+    value: Arc<crate::symbols::commands::Declarations>,
+    bytes: usize,
+}
+struct Prefix {
+    inputs: PrefixInputs,
+    value: Arc<CommandSignatures<'static>>,
+    bytes: usize,
+}
 #[derive(Default)]
 struct State {
     grammars: VecDeque<Grammar>,
     indexes: VecDeque<SourceIndex>,
     code: VecDeque<Code>,
+    declarations: VecDeque<Declarations>,
+    prefixes: VecDeque<Prefix>,
 }
 #[derive(Default)]
 pub(crate) struct Cache(Mutex<State>);
@@ -187,6 +204,98 @@ impl Binding {
     }
 }
 impl Cache {
+    pub fn prefix(&self, inputs: &PrefixInputs) -> Option<Arc<CommandSignatures<'static>>> {
+        let mut state = self.0.lock().unwrap();
+        let at = state
+            .prefixes
+            .iter()
+            .position(|entry| same_prefixes(&entry.inputs, inputs))?;
+        let entry = state.prefixes.remove(at).unwrap();
+        let result = entry.value.clone();
+        state.prefixes.push_back(entry);
+        Some(result)
+    }
+    pub fn insert_prefix(
+        &self,
+        inputs: PrefixInputs,
+        value: CommandSignatures<'static>,
+    ) -> Arc<CommandSignatures<'static>> {
+        let bytes = value.cache_bytes() + inputs.len() * (std::mem::size_of::<Document>() + 128);
+        let value = Arc::new(value);
+        if bytes > MAX_PREFIX_BYTES {
+            return value;
+        }
+        let mut state = self.0.lock().unwrap();
+        if let Some(entry) = state
+            .prefixes
+            .iter()
+            .find(|entry| same_prefixes(&entry.inputs, &inputs))
+        {
+            return entry.value.clone();
+        }
+        state
+            .prefixes
+            .retain(|entry| entry.inputs.iter().all(|(doc, _)| doc.strong_count() > 0));
+        state.prefixes.push_back(Prefix {
+            inputs,
+            value: value.clone(),
+            bytes,
+        });
+        while state.prefixes.len() > MAX_PREFIXES
+            || state
+                .prefixes
+                .iter()
+                .map(|entry| entry.bytes)
+                .sum::<usize>()
+                > MAX_PREFIX_BYTES
+        {
+            state.prefixes.pop_front();
+        }
+        value
+    }
+    pub fn declarations(
+        &self,
+        doc: &Weak<Document>,
+    ) -> Option<Arc<crate::symbols::commands::Declarations>> {
+        let mut state = self.0.lock().unwrap();
+        let at = state
+            .declarations
+            .iter()
+            .position(|entry| entry.document.ptr_eq(doc))?;
+        let entry = state.declarations.remove(at).unwrap();
+        let result = entry.value.clone();
+        state.declarations.push_back(entry);
+        Some(result)
+    }
+    pub fn insert_declarations(
+        &self,
+        document: Weak<Document>,
+        value: Arc<crate::symbols::commands::Declarations>,
+    ) {
+        let bytes = value.cache_bytes() + std::mem::size_of::<Document>() + 128;
+        if bytes > MAX_DECLARATION_BYTES {
+            return;
+        }
+        let mut state = self.0.lock().unwrap();
+        state
+            .declarations
+            .retain(|entry| entry.document.strong_count() > 0 && !entry.document.ptr_eq(&document));
+        state.declarations.push_back(Declarations {
+            document,
+            value,
+            bytes,
+        });
+        while state.declarations.len() > MAX_DECLARATIONS
+            || state
+                .declarations
+                .iter()
+                .map(|entry| entry.bytes)
+                .sum::<usize>()
+                > MAX_DECLARATION_BYTES
+        {
+            state.declarations.pop_front();
+        }
+    }
     pub fn code(
         &self,
         document: &Weak<Document>,
@@ -381,10 +490,144 @@ impl Cache {
     }
 }
 
+fn same_prefixes(left: &PrefixInputs, right: &PrefixInputs) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right)
+            .all(|((a, end_a), (b, end_b))| a.ptr_eq(b) && end_a == end_b)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{analysis::AnalysisContext, symbols::query_cache};
+
+    #[test]
+    fn declaration_facts_are_shared_only_for_the_exact_immutable_syntax() {
+        let source = r"\newcommand\one[1]{#1}\def\alias{\one}\let\copy\alias\newenvironment{box}[1]{}{}\edef\expanded{\one}";
+        let (mut ws, uri, scope) = workspace(source);
+        let cache = Arc::new(Cache::default());
+        let first = AnalysisContext::for_workspace(&ws, 0, 1, cache.clone()).run(|_| {
+            let doc = &ws.documents[&uri];
+            let facts = crate::symbols::commands::Declarations::get(&doc.text.source, &doc.syntax);
+            let cached = query_cache::source_signatures(&ws, &scope);
+            let direct =
+                CommandSignatures::source_context([(doc.text.source.as_str(), &doc.syntax)]);
+            assert!(cached.same_meanings(&direct));
+            facts
+        });
+        AnalysisContext::for_workspace(&ws, 0, 2, cache.clone()).run(|_| {
+            let doc = &ws.documents[&uri];
+            let facts = crate::symbols::commands::Declarations::get(&doc.text.source, &doc.syntax);
+            assert!(Arc::ptr_eq(&first, &facts));
+            let scratch = doc.syntax.clone();
+            let scratch = crate::symbols::commands::Declarations::get(&doc.text.source, &scratch);
+            assert!(!Arc::ptr_eq(&facts, &scratch));
+        });
+        // Even a syntax-only copy-on-write mutation must lose its proof.
+        ws.documents
+            .get_mut(&uri)
+            .unwrap()
+            .syntax
+            .definitions
+            .clear();
+        AnalysisContext::for_workspace(&ws, 0, 3, cache.clone()).run(|_| {
+            let doc = &ws.documents[&uri];
+            let facts = crate::symbols::commands::Declarations::get(&doc.text.source, &doc.syntax);
+            assert!(!Arc::ptr_eq(&first, &facts));
+            let cached = query_cache::source_signatures(&ws, &scope);
+            let direct =
+                CommandSignatures::source_context([(doc.text.source.as_str(), &doc.syntax)]);
+            assert!(cached.same_meanings(&direct));
+        });
+    }
+
+    #[test]
+    fn execution_prefixes_include_order_endpoints_and_complete_source_revisions() {
+        let (mut ws, uri, _) = workspace(r"\newcommand\one[1]{#1}\one{Text}");
+        let other = Url::parse("untitled:second.tex").unwrap();
+        ws.documents.insert(
+            other.clone(),
+            Document::new(&other, r"\newcommand\two[2]{#1#2}".into(), Some(1)),
+        );
+        let cache = Arc::new(Cache::default());
+        let first = AnalysisContext::for_workspace(&ws, 0, 1, cache.clone()).run(|_| {
+            AnalysisContext::lexical().run(|_| {
+                let doc = &ws.documents[&uri];
+                let first = CommandSignatures::at_prefixes(&[(doc, 0)]);
+                let again = CommandSignatures::at_prefixes(&[(doc, 0)]);
+                assert!(Arc::ptr_eq(&first, &again));
+                let whole = CommandSignatures::at_prefixes(&[(doc, doc.text.source.len())]);
+                assert!(!Arc::ptr_eq(&first, &whole));
+                assert!(!first.same_meanings(&whole));
+                let full =
+                    CommandSignatures::source_context([(doc.text.source.as_str(), &doc.syntax)]);
+                assert!(whole.same_meanings(&full));
+                let second = &ws.documents[&other];
+                let a = CommandSignatures::at_prefixes(&[(doc, 0), (second, 0)]);
+                let b = CommandSignatures::at_prefixes(&[(second, 0), (doc, 0)]);
+                assert!(!Arc::ptr_eq(&a, &b));
+                first
+            })
+        });
+        AnalysisContext::for_workspace(&ws, 0, 2, cache.clone()).run(|_| {
+            assert!(Arc::ptr_eq(
+                &first,
+                &CommandSignatures::at_prefixes(&[(&ws.documents[&uri], 0)])
+            ));
+        });
+        let changed =
+            ws.documents[&uri].with_text(&uri, r"\newcommand\one[1]{#1}\one{Hook}".into(), Some(2));
+        ws.documents.insert(uri.clone(), changed);
+        AnalysisContext::for_workspace(&ws, 0, 3, cache).run(|_| {
+            let changed = CommandSignatures::at_prefixes(&[(&ws.documents[&uri], 0)]);
+            assert!(
+                !Arc::ptr_eq(&first, &changed),
+                "suffix-only changes affect source-wide budgets"
+            );
+        });
+    }
+
+    #[test]
+    fn declaration_and_execution_prefix_storage_obey_entry_and_byte_limits() {
+        let mut ws = Workspace::default();
+        for i in 0..MAX_DECLARATIONS + 8 {
+            let uri = Url::parse(&format!("untitled:{i}.tex")).unwrap();
+            ws.documents.insert(
+                uri.clone(),
+                Document::new(&uri, r"\def\one#1{#1}".into(), Some(1)),
+            );
+        }
+        let cache = Arc::new(Cache::default());
+        AnalysisContext::for_workspace(&ws, 0, 1, cache.clone()).run(|_| {
+            for doc in ws.documents.values() {
+                crate::symbols::commands::Declarations::get(&doc.text.source, &doc.syntax);
+                CommandSignatures::at_prefixes(&[(doc, 0)]);
+            }
+        });
+        let state = cache.0.lock().unwrap();
+        assert!(!state.declarations.is_empty());
+        assert!(state.declarations.len() <= MAX_DECLARATIONS);
+        assert!(
+            state
+                .declarations
+                .iter()
+                .map(|entry| entry.bytes)
+                .sum::<usize>()
+                <= MAX_DECLARATION_BYTES
+        );
+        assert!(!state.prefixes.is_empty());
+        assert!(state.prefixes.len() <= MAX_PREFIXES);
+        assert!(
+            state
+                .prefixes
+                .iter()
+                .map(|entry| entry.bytes)
+                .sum::<usize>()
+                <= MAX_PREFIX_BYTES
+        );
+    }
 
     fn workspace(source: &str) -> (Workspace, Url, BTreeSet<Url>) {
         let uri = Url::parse("untitled:persistent.tex").unwrap();

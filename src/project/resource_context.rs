@@ -130,14 +130,6 @@ const BUILTINS: &[&str] = &[
     "addsectionbib",
 ];
 
-fn prefix(syntax: &Syntax, end: usize) -> Syntax {
-    let mut result = syntax.clone();
-    result.commands.retain(|command| command.span.start <= end);
-    result.definitions.retain(|entry| entry.span.start < end);
-    result.environments.retain(|entry| entry.span.start < end);
-    result.command_undefinitions.retain(|at, _| *at < end);
-    result
-}
 pub(crate) fn grouped(source: &str, parsed: &Syntax, end: usize) -> bool {
     let mut depth = 0usize;
     let mut at = 0;
@@ -268,17 +260,9 @@ impl Analysis {
             let snapshots: Vec<_> = self
                 .prefixes
                 .iter()
-                .filter_map(|(uri, end)| {
-                    ws.documents
-                        .get(uri)
-                        .map(|doc| (&doc.text.source, prefix(&doc.syntax, *end)))
-                })
+                .filter_map(|(uri, end)| ws.documents.get(uri).map(|doc| (doc, *end)))
                 .collect();
-            let signatures = CommandSignatures::source_context(
-                snapshots
-                    .iter()
-                    .map(|(text, syntax)| (text.as_str(), syntax)),
-            );
+            let signatures = CommandSignatures::at_prefixes(&snapshots);
             let positions = signatures.source_command_positions(source, &doc.syntax);
             let declarations = doc
                 .syntax

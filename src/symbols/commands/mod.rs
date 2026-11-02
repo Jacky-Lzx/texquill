@@ -7,7 +7,9 @@ use crate::{
     },
 };
 use lsp_types::Url;
+mod facts;
 mod memo;
+pub(crate) use facts::Declarations;
 mod tokenization;
 pub(crate) use tokenization::InlineTokenization;
 
@@ -1367,6 +1369,57 @@ impl<'a> CommandSignatures<'a> {
         Self::source_context_with(documents, &preliminary)
     }
 
+    /// Exact ordered execution prefixes; retaining full document identities is
+    /// intentional because suffix text participates in reader and work budgets.
+    pub(crate) fn at_prefixes(
+        documents: &[(&Document, usize)],
+    ) -> std::sync::Arc<CommandSignatures<'static>> {
+        let binding =
+            crate::analysis::AnalysisContext::current().and_then(|context| context.binding.clone());
+        let inputs: Option<crate::analysis_cache::PrefixInputs> = documents
+            .iter()
+            .map(|(doc, end)| {
+                Some((
+                    binding.as_ref()?.document(&doc.text.source, &doc.syntax)?,
+                    *end,
+                ))
+            })
+            .collect();
+        if let Some(value) = binding
+            .as_ref()
+            .zip(inputs.as_ref())
+            .and_then(|(binding, inputs)| binding.cache.prefix(inputs))
+        {
+            return value;
+        }
+        let prefixes: Vec<_> = documents
+            .iter()
+            .map(|(doc, end)| {
+                if *end >= doc.text.source.len() {
+                    return Cow::Borrowed(&doc.syntax);
+                }
+                let mut parsed = doc.syntax.clone();
+                parsed.commands.retain(|command| command.span.start <= *end);
+                parsed.definitions.retain(|entry| entry.span.start < *end);
+                parsed.environments.retain(|entry| entry.span.start < *end);
+                parsed.command_undefinitions.retain(|at, _| *at < *end);
+                Cow::Owned(parsed)
+            })
+            .collect();
+        let value = CommandSignatures::source_context(
+            documents
+                .iter()
+                .zip(&prefixes)
+                .map(|((doc, _), parsed)| (doc.text.source.as_str(), parsed.as_ref())),
+        )
+        .into_owned();
+        if let Some((binding, inputs)) = binding.zip(inputs) {
+            binding.cache.insert_prefix(inputs, value)
+        } else {
+            std::sync::Arc::new(value)
+        }
+    }
+
     /// The preliminary editing grammar must cover these exact ordered sources.
     /// Filtering still creates a separate execution grammar with its own cache.
     pub(crate) fn source_context_with(
@@ -1453,77 +1506,34 @@ impl<'a> CommandSignatures<'a> {
             local.keys().map(|name| (name.clone(), None)).collect();
         let mut aliases = BTreeMap::new();
         let mut literal_operands = BTreeMap::new();
-        for &(source, parsed) in &documents {
+        let facts: Vec<_> = documents
+            .iter()
+            .map(|(source, parsed)| Declarations::get(source, parsed))
+            .collect();
+        for (&(source, parsed), facts) in documents.iter().zip(&facts) {
             let positions = source_context
                 .map(|signatures| signatures.source_command_positions(source, parsed));
-            for (entry, environment) in parsed
+            for ((entry, environment), fact) in parsed
                 .definitions
                 .iter()
                 .map(|entry| (entry, false))
                 .chain(parsed.environments.iter().map(|entry| (entry, true)))
-                .filter(|(entry, _)| {
+                .zip(&facts.0)
+                .filter(|(_, fact)| {
                     positions.as_ref().is_none_or(|positions| {
-                        let declaration = entry.detail.strip_prefix("Defined with \\");
-                        let end = parsed
-                            .commands
-                            .partition_point(|command| command.span.start < entry.span.start);
-                        parsed.commands[..end]
-                            .iter()
-                            .rev()
-                            .find(|command| Some(command.name.as_str()) == declaration)
-                            .is_some_and(|command| positions.contains(&command.span.start))
+                        fact.position.is_some_and(|at| positions.contains(&at))
                     })
                 })
             {
-                // Environments and ordinary commands share their start control
-                // in TeX. Duplicates must invalidate both calls and aliases.
-                let mut signature = if environment {
-                    environment_start_signature(source, parsed, entry)
-                } else {
-                    source_definition(source, parsed, entry, false)
-                };
-                let tex_definition = TexOperands::definition(source, parsed, entry);
-                let tex_known = tex_definition.is_some();
-                let tex = tex_definition
-                    .filter(|(operands, _)| operands.delimited() || signature.is_none())
-                    .map(|(operands, _)| operands);
-                if TexOperands::declares(entry) && (tex.is_some() || !tex_known) {
-                    // The help reader deliberately has fewer TeX token rules.
-                    // Never fall back to its arity for unrecognized parameter text.
-                    signature = None;
-                }
-                let bodies = environment
-                    .then(|| environment_bodies(source, parsed, entry))
-                    .flatten();
-                let copied =
-                    literal_copy_target(source, parsed, entry, environment).map(|(name, _)| name);
-                let alias = signature
-                    .as_ref()
-                    .filter(|s| s.parameters.is_empty())
-                    .and_then(|_| {
-                        if environment {
-                            bodies
-                                .as_ref()
-                                .and_then(|(begin, _)| body_alias(source, begin))
-                        } else {
-                            source_alias(source, parsed, entry)
-                        }
-                    });
+                // Interpret immutable declarations in this project's execution context.
+                let mut signature = fact.signature.clone();
+                let tex = fact.tex.clone();
+                let copied = fact.copied.clone();
+                let alias = fact.alias.clone();
                 if environment {
                     let name = format!("end{}", entry.name);
-                    let ending = signature
-                        .as_ref()
-                        .filter(|_| bodies.is_some() || entry.detail == "Defined with \\newtheorem")
-                        .map(|_| Signature {
-                            name: name.clone(),
-                            parameters: vec![],
-                            documentation: entry.detail.clone(),
-                            starred: false,
-                            nested_brackets: true,
-                        });
-                    let alias = ending
-                        .as_ref()
-                        .and_then(|_| bodies.as_ref().and_then(|(_, end)| body_alias(source, end)));
+                    let ending = fact.ending.clone();
+                    let alias = fact.ending_alias.clone();
                     if let Some(target) = &copied {
                         literal_operands
                             .entry(Cow::Owned(name.clone()))
@@ -1550,10 +1560,7 @@ impl<'a> CommandSignatures<'a> {
                 }
                 // Expanded definitions capture a meaning at definition time;
                 // their lexical body cannot establish a late-bound alias.
-                let expanded = matches!(
-                    entry.detail.strip_prefix("Defined with \\"),
-                    Some("edef" | "xdef" | "csedef" | "csxdef")
-                );
+                let expanded = fact.expanded;
                 if expanded && alias.is_some() {
                     signature = None;
                 }
@@ -1600,8 +1607,8 @@ impl<'a> CommandSignatures<'a> {
         // declarations too: source-context filtering must not hide a competing
         // definition. Delimiter controls are excluded because they remain data.
         let mut identities = BTreeMap::new();
-        for &(source, parsed) in &documents {
-            for entry in &parsed.definitions {
+        for (&(_, parsed), facts) in documents.iter().zip(&facts) {
+            for (entry, fact) in parsed.definitions.iter().zip(&facts.0) {
                 let ordinary = local.get(entry.name.as_str()).and_then(Option::as_ref);
                 let tex = tex_operands
                     .get(entry.name.as_str())
@@ -1622,10 +1629,7 @@ impl<'a> CommandSignatures<'a> {
                             && t.delimiters[0].iter().all(|token| !token.starts_with('\\'))
                     },
                 );
-                let identity = (one
-                    && command_definition_body(source, parsed, entry)
-                        .is_some_and(|body| source[body.span].trim() == "#1"))
-                .then_some(());
+                let identity = (one && fact.identity_body).then_some(());
                 identities
                     .entry(Cow::Borrowed(entry.name.as_str()))
                     .and_modify(|value| *value = None)

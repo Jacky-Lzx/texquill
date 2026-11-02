@@ -27,6 +27,9 @@ pub(crate) struct Completion {
     requested: Arc<tokio::sync::Notify>,
 }
 impl Completion {
+    pub(crate) fn remember_path(&self, prepared: crate::language::path_cache::Prepared) {
+        self.cache.lock().unwrap().insert_paths(prepared);
+    }
     pub(crate) fn covers(&self, ws: &crate::project::workspace::Workspace, epoch: u64) -> bool {
         let cache = self.cache.lock().unwrap();
         ws.pending_dependencies
@@ -98,15 +101,22 @@ impl Completion {
                     state.origins.clone(),
                 )
             };
-            if !eager {
+            let eager = if eager {
+                true
+            } else {
                 loop {
+                    let requested = self.requested.notified();
+                    if std::mem::take(&mut self.state.lock().unwrap().eager) {
+                        break true;
+                    }
                     let revision = workspace.revision();
                     tokio::select! {
-                        _ = tokio::time::sleep(std::time::Duration::from_millis(120)) => break,
+                        _ = tokio::time::sleep(std::time::Duration::from_millis(120)) => break false,
                         _ = workspace.changed_since(revision) => {}
+                        _ = requested => {}
                     }
                 }
-            }
+            };
             let (snapshot, revision, epoch) = {
                 let inputs = workspace.read_unindexed().await;
                 (
@@ -117,45 +127,68 @@ impl Completion {
             };
             let cache = self.cache.clone();
             let analysis = queries.analyses.clone();
-            let result = queries
-                .run_background(move |cancel| {
-                    crate::analysis::AnalysisContext::new().run(|context| {
-                        let mut snapshot = snapshot;
-                        let updates = crate::analysis::AnalysisContext::for_workspace(
-                            &snapshot,
-                            epoch,
-                            revision,
-                            analysis.clone(),
-                        );
-                        let changed = updates.run(|_| snapshot.refresh_pending_dependencies());
-                        let shared = crate::analysis::AnalysisContext::for_workspace(
-                            &snapshot, epoch, revision, analysis,
-                        );
-                        let mut prepared = Vec::new();
-                        for uri in &origins {
-                            let Some(doc) = snapshot.documents.get(uri) else {
-                                continue;
-                            };
-                            context.check()?;
-                            if doc.version.is_some()
-                                && !cache.lock().unwrap().covers(&snapshot, epoch, uri)
+            let work = move |cancel: &crate::analysis::AnalysisContext| {
+                crate::analysis::AnalysisContext::new().run(|context| {
+                    let mut snapshot = snapshot;
+                    let updates = crate::analysis::AnalysisContext::for_workspace(
+                        &snapshot,
+                        epoch,
+                        revision,
+                        analysis.clone(),
+                    );
+                    let changed = updates.run(|_| snapshot.refresh_pending_dependencies());
+                    let shared = crate::analysis::AnalysisContext::for_workspace(
+                        &snapshot, epoch, revision, analysis,
+                    );
+                    let mut prepared = Vec::new();
+                    let mut paths = Vec::new();
+                    for uri in &origins {
+                        let Some(doc) = snapshot.documents.get(uri) else {
+                            continue;
+                        };
+                        context.check()?;
+                        if doc.version.is_some()
+                            && !cache.lock().unwrap().covers(&snapshot, epoch, uri)
+                        {
+                            if let Some(entry) =
+                                shared.run(|_| Prepared::build(&snapshot, uri, epoch))
                             {
-                                if let Some(entry) =
-                                    shared.run(|_| Prepared::build(&snapshot, uri, epoch))
-                                {
-                                    prepared.push(entry);
-                                }
+                                prepared.push(entry);
                             }
                         }
-                        context.check()?;
-                        cancel.check()?;
-                        Ok((snapshot, changed, prepared))
-                    })
+                        if doc.version.is_some()
+                            && !cache.lock().unwrap().covers_paths(&snapshot, epoch, uri)
+                        {
+                            if let Some(entry) = shared.run(|_| {
+                                crate::language::path_cache::Prepared::build(&snapshot, uri, epoch)
+                            }) {
+                                paths.push(entry);
+                            }
+                        }
+                    }
+                    context.check()?;
+                    cancel.check()?;
+                    Ok((snapshot, changed, prepared, paths))
                 })
-                .await;
+            };
+            // A native input request needs its certificate during typing.
+            // Automatic views must not keep that single coalesced job behind
+            // the background semaphore. Ordinary preparation remains idle work.
+            let result = if eager {
+                queries.run(work).await
+            } else {
+                let requested = self.requested.notified();
+                if self.state.lock().unwrap().eager {
+                    continue;
+                }
+                tokio::select! {
+                    value = queries.run_background(work) => value,
+                    _ = requested => continue,
+                }
+            };
             let mut retry;
             let observed;
-            if let Ok((snapshot, changed, prepared)) = result {
+            if let Ok((snapshot, changed, prepared, paths)) = result {
                 let delivery = snapshot.diagnostic_delivery.clone();
                 let mut inputs = workspace.write_prepared().await;
                 let current =
@@ -166,6 +199,11 @@ impl Completion {
                 for entry in prepared {
                     if entry.valid_for(&inputs, workspace.completion_epoch()) {
                         self.cache.lock().unwrap().insert(entry);
+                    }
+                }
+                for entry in paths {
+                    if entry.valid_for(&inputs, workspace.completion_epoch()) {
+                        self.cache.lock().unwrap().insert_paths(entry);
                     }
                 }
                 observed = workspace.revision();
@@ -201,6 +239,176 @@ mod tests {
     use crate::diagnostics::diagnostic::Delivery;
     use crate::project::workspace::{Document, Workspace};
     use lsp_types::Url;
+    #[tokio::test]
+    async fn requested_path_preparation_does_not_wait_for_automatic_view_capacity() {
+        let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        struct Release(Arc<(Mutex<bool>, std::sync::Condvar)>);
+        impl Drop for Release {
+            fn drop(&mut self) {
+                *self.0 .0.lock().unwrap() = true;
+                self.0 .1.notify_all();
+            }
+        }
+        let release = Release(gate.clone());
+        let started = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let queries = Queries::default();
+        let mut holders = Vec::new();
+        for _ in 0..3 {
+            let queries = queries.clone();
+            let gate = gate.clone();
+            let started = started.clone();
+            holders.push(tokio::spawn(async move {
+                queries
+                    .run_background(move |_| {
+                        started.fetch_add(1, Ordering::SeqCst);
+                        let (mutex, condition) = &*gate;
+                        let _guard = condition
+                            .wait_while(mutex.lock().unwrap(), |open| !*open)
+                            .unwrap();
+                        Ok(())
+                    })
+                    .await
+            }));
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while started.load(Ordering::SeqCst) != 3 {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("main.tex");
+        let uri = Url::from_file_path(&path).unwrap();
+        let source =
+            "\\documentclass{article}\n\\begin{document}\n\\input{missing/}\n\\end{document}\n";
+        std::fs::write(path, source).unwrap();
+        let mut inputs = Workspace::default();
+        inputs.open(uri.clone(), source.into(), 1);
+        let workspace = WorkspaceStore::new(inputs);
+        let completion = Completion::default();
+        let (client, _outgoing) = Client::new();
+        completion.schedule(
+            workspace.clone(),
+            queries,
+            client,
+            Arc::new(AtomicBool::new(false)),
+            true,
+            Some(uri.clone()),
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                let inputs = workspace.read_unindexed().await;
+                if completion.cache.lock().unwrap().covers_paths(
+                    &inputs,
+                    workspace.completion_epoch(),
+                    &uri,
+                ) {
+                    break;
+                }
+                drop(inputs);
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("automatic views blocked requested path preparation");
+        completion.close();
+        drop(release);
+        for holder in holders {
+            holder.await.unwrap().unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn native_path_preparation_keeps_prefix_edits_unindexed_and_rejects_new_source_edges() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("Tex")).unwrap();
+        std::fs::write(
+            dir.path().join("Tex/0_Abstract.tex"),
+            r"\newcommand\frominput[2]{#1#2}",
+        )
+        .unwrap();
+        let source =
+            "\\documentclass{article}\n\\begin{document}\n\\input{Tex/}\n\\end{document}\n";
+        let path = dir.path().join("main.tex");
+        std::fs::write(&path, source).unwrap();
+        let uri = Url::from_file_path(path).unwrap();
+        let mut inputs = Workspace::default();
+        inputs.client.snippets = true;
+        inputs.diagnostic_delivery = Delivery::new(true, true);
+        inputs.open(uri.clone(), source.into(), 1);
+        let workspace = WorkspaceStore::new(inputs);
+        let completion = Completion::default();
+        let (client, _outgoing) = Client::new();
+        completion.schedule(
+            workspace.clone(),
+            Queries::default(),
+            client,
+            Arc::new(AtomicBool::new(false)),
+            true,
+            Some(uri.clone()),
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                let inputs = workspace.read_unindexed().await;
+                if completion.cache.lock().unwrap().covers_paths(
+                    &inputs,
+                    workspace.completion_epoch(),
+                    &uri,
+                ) {
+                    break;
+                }
+                drop(inputs);
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("path preparation did not finish");
+        for (index, prefix) in ["Tex/0", "Tex/0_Ab", "Tex/0_Abstract.tex"]
+            .into_iter()
+            .enumerate()
+        {
+            let current = source.replace("Tex/", prefix);
+            {
+                let mut inputs = workspace.write_changes().await;
+                let doc =
+                    inputs.documents[&uri].with_text(&uri, current.clone(), Some(index as i32 + 2));
+                inputs.documents.insert(uri.clone(), doc);
+                inputs.defer_dependencies(uri.clone());
+            }
+            let inputs = workspace.read_unindexed().await;
+            let position = inputs.documents[&uri]
+                .text
+                .position(current.find(prefix).unwrap() + prefix.len());
+            let reply = completion.complete(&inputs, workspace.completion_epoch(), &uri, position);
+            if prefix.ends_with(".tex") {
+                assert!(
+                    reply.is_none(),
+                    "a resolved input must refresh project semantics"
+                );
+                assert!(!completion.covers(&inputs, workspace.completion_epoch()));
+            } else {
+                assert!(reply
+                    .unwrap()
+                    .iter()
+                    .any(|item| item.label == "Tex/0_Abstract.tex"));
+                assert!(completion.covers(&inputs, workspace.completion_epoch()));
+                assert!(
+                    inputs.has_pending_dependencies(),
+                    "completion flushed dependency propagation"
+                );
+            }
+        }
+        let inputs = workspace.read().await;
+        assert!(inputs.documents.values().any(|doc| doc
+            .syntax
+            .definitions
+            .iter()
+            .any(|entry| entry.name == "frominput")));
+        drop(inputs);
+        completion.close();
+    }
+
     #[tokio::test]
     async fn prepared_replies_leave_project_refresh_to_the_coalesced_worker() {
         let uri = Url::parse("untitled:worker.tex").unwrap();

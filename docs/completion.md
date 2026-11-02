@@ -9,8 +9,11 @@ opens. Eligible prose, comment and command-prefix edits reuse those templates;
 replacement ranges and snippet decisions still use the current text. Macro,
 dependency, documentation and settings changes invalidate affected preparation.
 Cold requests, complex parameter readers, literal regions and unsupported
-contexts use the full contextual analysis. Label, citation and path providers
-retain their existing context checks. No editor configuration change is needed.
+contexts use the full contextual analysis. Standalone native `\input` filename
+prefixes in the compilation root also reuse their verified context while the
+filename is unresolved. Selecting an existing input file refreshes dependencies
+before its declarations become candidates. Directory candidates and replacement
+ranges use the current filesystem and text. No editor configuration change is needed.
 
 Math-only commands from the built-in catalog and loaded packages (such as `alpha`, `frac`, and `dfrac`) are completed only in math mode. The server recognizes `$…$`, `$$…$$`, `\(…\)`, `\[…\]`, `ensuremath`, and common math environments; text arguments such as `text` and `mbox` inside formulas restore text mode. Comments, verbatim content, escaped symbols, and unexpanded command-name operands do not change the mode. User definitions retain priority, and math commands remain available when declaring, copying, or inspecting command names. This check uses static syntax in the current file; it does not expand macros or infer math mode for custom environments.
 

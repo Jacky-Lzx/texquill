@@ -532,12 +532,19 @@ fn canonical_context(
 #[derive(Default)]
 pub(crate) struct Cache {
     entries: VecDeque<Arc<Prepared>>,
+    paths: VecDeque<super::path_cache::Prepared>,
 }
 impl Cache {
+    pub(crate) fn covers_paths(&self, ws: &Workspace, epoch: u64, uri: &Url) -> bool {
+        self.paths
+            .iter()
+            .any(|entry| entry.origin() == uri && entry.valid_for(ws, epoch))
+    }
     pub(crate) fn covers(&self, ws: &Workspace, epoch: u64, uri: &Url) -> bool {
         self.entries
             .iter()
             .any(|entry| &entry.inputs.origin == uri && entry.inputs.matches(ws, epoch))
+            || self.covers_paths(ws, epoch, uri)
     }
     pub(crate) fn complete(
         &self,
@@ -549,8 +556,32 @@ impl Cache {
         self.entries
             .iter()
             .rev()
-            .find(|entry| &entry.inputs.origin == uri && entry.inputs.matches(ws, epoch))?
-            .complete(ws, position)
+            .find(|entry| &entry.inputs.origin == uri && entry.inputs.matches(ws, epoch))
+            .and_then(|entry| entry.complete(ws, position))
+            .or_else(|| {
+                self.paths
+                    .iter()
+                    .rev()
+                    .filter(|entry| entry.origin() == uri)
+                    .find_map(|entry| entry.complete(ws, epoch, position))
+            })
+    }
+    pub(crate) fn insert_paths(&mut self, prepared: super::path_cache::Prepared) {
+        if self
+            .paths
+            .iter()
+            .any(|entry| entry.origin() == prepared.origin() && entry.revision > prepared.revision)
+        {
+            return;
+        }
+        self.paths
+            .retain(|entry| entry.origin() != prepared.origin());
+        self.paths.push_back(prepared);
+        while self.paths.len() > MAX_ORIGINS
+            || self.paths.iter().map(|entry| entry.bytes()).sum::<usize>() > 8 * 1024 * 1024
+        {
+            self.paths.pop_front();
+        }
     }
     pub(crate) fn insert(&mut self, prepared: Prepared) {
         self.entries

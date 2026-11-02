@@ -10,6 +10,7 @@ pub mod features;
 pub(crate) mod folding;
 pub(crate) mod math_context;
 pub mod navigation;
+pub(crate) mod path_cache;
 pub mod path_completion;
 pub mod semantic;
 pub(crate) mod semantic_cache;

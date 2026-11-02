@@ -995,11 +995,22 @@ impl Backend {
             return;
         };
         let updated = doc.with_text(&uri, text.source, Some(params.text_document.version));
+        let prepare_path = crate::language::path_cache::changed_candidate(doc, &updated);
         workspace.documents.insert(uri.clone(), updated);
         workspace.clear_build_diagnostics(&uri);
-        workspace.defer_dependencies(uri);
+        workspace.defer_dependencies(uri.clone());
         self.pending_change_publish.store(true, Ordering::SeqCst);
         drop(workspace);
+        if prepare_path {
+            self.completion.schedule(
+                self.workspace.clone(),
+                self.queries.clone(),
+                self.client.clone(),
+                self.pending_change_publish.clone(),
+                true,
+                Some(uri),
+            );
+        }
         if !self.workspace.has_queued_changes() {
             self.finish_changes().await;
         }
@@ -1543,7 +1554,7 @@ impl Backend {
         &self,
         params: CompletionParams,
     ) -> Result<Option<CompletionResponse>> {
-        {
+        let (prepare_path, epoch) = {
             let position = &params.text_document_position;
             let workspace = self.workspace.read_unindexed().await;
             if let Some(items) = self.completion.complete(
@@ -1564,24 +1575,43 @@ impl Backend {
                     CompletionResponse::Array(items)
                 }));
             }
-        }
+            let prepare = workspace
+                .documents
+                .get(&document_uri(position.text_document.uri.clone()))
+                .is_some_and(|doc| crate::language::path_cache::candidate(doc, position.position));
+            (prepare, self.workspace.completion_epoch())
+        };
         self.completion.schedule(
             self.workspace.clone(),
             self.queries.clone(),
             self.client.clone(),
             self.pending_change_publish.clone(),
-            false,
+            prepare_path,
             Some(document_uri(
                 params.text_document_position.text_document.uri.clone(),
             )),
         );
+        let completion = self.completion.clone();
         self.read_query(move |workspace| {
             let position = params.text_document_position;
-            let mut items = features::completion(
-                workspace,
-                &document_uri(position.text_document.uri),
-                position.position,
-            );
+            let uri = document_uri(position.text_document.uri);
+            let mut items = if prepare_path {
+                let (items, prepared) = crate::language::path_cache::Prepared::complete_and_prepare(
+                    workspace,
+                    &uri,
+                    position.position,
+                    epoch,
+                );
+                if let Some(prepared) = prepared.filter(|_| {
+                    !crate::analysis::AnalysisContext::current()
+                        .is_some_and(|context| context.cancelled())
+                }) {
+                    completion.remember_path(prepared);
+                }
+                items
+            } else {
+                features::completion(workspace, &uri, position.position)
+            };
             let limit = workspace.config.indexing.completion_limit;
             let incomplete = items.len() >= limit || !workspace.index_truncated.is_empty();
             items.truncate(limit);

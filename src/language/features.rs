@@ -1253,7 +1253,7 @@ pub fn completion(workspace: &Workspace, uri: &Url, position: Position) -> Vec<C
     crate::analysis::AnalysisContext::new().run(|_| completion_in_query(workspace, uri, position))
 }
 
-fn completion_in_query(
+pub(crate) fn completion_in_query(
     workspace: &Workspace,
     uri: &Url,
     position: Position,
