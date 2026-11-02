@@ -157,11 +157,7 @@ pub(crate) fn calls_in(
             .map(|(uri, _)| (uri.clone(), Vec::new()))
             .collect();
     }
-    let signatures = crate::symbols::commands::CommandSignatures::source_context(
-        documents
-            .iter()
-            .map(|(_, doc)| (doc.text.source.as_str(), &doc.syntax)),
-    );
+    let signatures = crate::symbols::query_cache::source_signatures(workspace, sources);
     documents
         .iter()
         .map(|(uri, doc)| {

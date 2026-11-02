@@ -1,10 +1,31 @@
 //! Shared document revisions with copy-on-write mutation for workspace snapshots.
 use super::workspace::Document;
 use lsp_types::Url;
-use std::{collections::btree_map, collections::BTreeMap, ops::Index, sync::Arc};
+use std::{
+    collections::btree_map,
+    collections::BTreeMap,
+    ops::Index,
+    sync::{Arc, Weak},
+};
 
 #[derive(Clone, Debug, Default)]
 pub struct Documents(BTreeMap<Url, Arc<Document>>);
+
+/// Weak identities validate analyses without retaining obsolete source trees.
+#[derive(Clone)]
+pub(crate) struct Revisions(Vec<(Url, Weak<Document>)>);
+
+impl Revisions {
+    pub(crate) fn current(&self, documents: &Documents) -> bool {
+        self.0.len() == documents.len()
+            && self.0.iter().all(|(uri, revision)| {
+                documents
+                    .0
+                    .get(uri)
+                    .is_some_and(|doc| revision.as_ptr() == Arc::as_ptr(doc))
+            })
+    }
+}
 
 pub type Iter<'a> = std::iter::Map<
     btree_map::Iter<'a, Url, Arc<Document>>,
@@ -12,6 +33,14 @@ pub type Iter<'a> = std::iter::Map<
 >;
 
 impl Documents {
+    pub(crate) fn revisions(&self) -> Revisions {
+        Revisions(
+            self.0
+                .iter()
+                .map(|(uri, doc)| (uri.clone(), Arc::downgrade(doc)))
+                .collect(),
+        )
+    }
     pub(crate) fn same_revisions(&self, other: &Self) -> bool {
         self.len() == other.len()
             && self.0.iter().all(|(uri, doc)| {
@@ -123,6 +152,27 @@ impl Extend<(Url, Document)> for Documents {
 mod tests {
     use super::*;
     use crate::project::workspace::Workspace;
+
+    #[test]
+    fn weak_revisions_invalidate_in_place_updates_and_do_not_pin_old_documents() {
+        let uri = Url::parse("untitled:revision.tex").unwrap();
+        let mut documents = Documents::default();
+        documents.insert(uri.clone(), Document::new(&uri, "old".into(), Some(1)));
+        let revisions = documents.revisions();
+        assert!(revisions.current(&documents));
+        let snapshot = documents.clone();
+        documents.get_mut(&uri).unwrap().version = Some(2);
+        assert!(!revisions.current(&documents));
+        assert!(revisions.current(&snapshot));
+        drop(snapshot);
+        assert!(revisions.0[0].1.upgrade().is_none());
+        let revisions = documents.revisions();
+        documents.remove(&uri);
+        assert!(!revisions.current(&documents));
+        assert!(revisions.0[0].1.upgrade().is_none());
+        documents.insert(uri.clone(), Document::new(&uri, "new".into(), Some(2)));
+        assert!(!revisions.current(&documents));
+    }
 
     #[test]
     fn snapshots_share_revisions_and_isolate_mutation_replacement_and_removal() {

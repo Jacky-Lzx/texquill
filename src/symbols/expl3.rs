@@ -127,6 +127,21 @@ fn analyze(doc: &Document, include_data: bool) -> Analysis {
     } else {
         vec![]
     };
+    if ![
+        "ExplSyntaxOn",
+        "ProvidesExplPackage",
+        "ProvidesExplClass",
+        "ProvidesExplFile",
+    ]
+    .iter()
+    .any(|name| source.contains(name))
+    {
+        return Analysis {
+            entries: vec![],
+            bodies: deferred,
+            data,
+        };
+    }
     let mut declarations = BTreeMap::new();
     let mut result = Vec::new();
     let mut at = 0;

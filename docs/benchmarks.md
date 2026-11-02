@@ -9,6 +9,28 @@ cargo build --release --locked
 python3 benchmarks/editing.py --output target/benchmarks/latest.json
 ```
 
+## Comparing an existing project
+
+`benchmarks/project_latency.py` compares two release binaries on a temporary copy
+of a self-contained project. It preserves local class/package files and excludes
+build outputs. The original files are never edited or compiled.
+
+```sh
+python3 benchmarks/project_latency.py /path/to/project \
+  --before target/benchmarks/before --after target/release/texquill \
+  --document main.tex --needle '\maketitle' --offset 4 \
+  --output target/benchmarks/project-latency.json
+```
+
+The script alternates request order and process startup order, measures warmed
+queries, single edits and an edit burst, and checks that both versions return the
+same responses after each operation (excluding opaque `resultId` values). It
+disables distribution discovery, save-triggered builds and ChkTeX to isolate
+source analysis. JSON includes all samples, medians and binary hashes. This is a
+server protocol measurement, not an editor UI latency measurement.
+
+## Generated editing sessions
+
 By default, three sizes of deterministically generated projects are measured: small is 1 chapter and 16 sections per chapter; medium is 4 chapters and 32 sections per chapter; large is 8 chapters and 64 sections per chapter. Each project contains the main document, chapter files and BibTeX database. The text contains Chinese, emoji, mathematical environment, user macros, cross-file labels and citations. Projects are all below the default index budget; the test rejects index truncation.
 
 Start 3 independent servers at each level, warm up for 3 cycles each time, and then measure for 20 cycles. Execute every cycle:

@@ -3,6 +3,7 @@ use crate::{diagnostics::diagnostic_inputs::Files, project::source_inputs, symbo
 use std::{cell::RefCell, path::Path, rc::Rc, sync::Arc};
 
 pub(crate) struct AnalysisContext {
+    pub(crate) groups: Rc<RefCell<crate::parser::group_cache::Cache>>,
     pub(crate) symbols: RefCell<query_cache::Cache>,
     pub(crate) sources: RefCell<source_inputs::Query>,
     observed: Option<Rc<RefCell<Files>>>,
@@ -27,6 +28,10 @@ impl AnalysisContext {
     pub(crate) fn new() -> Rc<Self> {
         let parent = Self::current();
         Rc::new(Self {
+            groups: parent
+                .as_ref()
+                .map(|parent| parent.groups.clone())
+                .unwrap_or_default(),
             symbols: RefCell::default(),
             sources: RefCell::default(),
             observed: parent.as_ref().and_then(|parent| parent.observed.clone()),
@@ -43,6 +48,13 @@ impl AnalysisContext {
             parent.as_ref().is_some_and(|parent| parent()) || cancelled()
         }));
         state.cache_enabled = false;
+        context
+    }
+
+    /// Mutating work may share pure text reads, but never workspace indexes.
+    pub(crate) fn lexical() -> Rc<Self> {
+        let mut context = Self::new();
+        Rc::get_mut(&mut context).unwrap().cache_enabled = false;
         context
     }
 
@@ -144,5 +156,21 @@ mod tests {
             assert!(context.cancelled());
         });
         assert!(AnalysisContext::current().is_none());
+    }
+
+    #[test]
+    fn updates_share_lexical_reads_without_caching_mutable_workspace_queries() {
+        AnalysisContext::new().run(|parent| {
+            AnalysisContext::lexical().run(|update| {
+                assert!(AnalysisContext::current_query().is_none());
+                assert!(Rc::ptr_eq(&parent.groups, &update.groups));
+                AnalysisContext::new().run(|query| {
+                    assert!(AnalysisContext::current_query().is_some());
+                    assert!(Rc::ptr_eq(&update.groups, &query.groups));
+                });
+                assert!(AnalysisContext::current_query().is_none());
+            });
+            assert!(AnalysisContext::current_query().is_some());
+        });
     }
 }

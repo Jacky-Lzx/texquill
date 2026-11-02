@@ -17,10 +17,24 @@ pub(super) struct Candidate<E> {
 pub(super) fn index<E: Clone + Eq>(
     ws: &Workspace,
     origin: &Url,
+    offset: usize,
     roots: &[&str],
     read: impl Fn(&Document, &CommandSignatures<'_>) -> BTreeMap<usize, Candidate<E>>,
     selected: impl Fn(&E) -> bool,
 ) -> BTreeMap<Url, BTreeMap<usize, E>> {
+    let Some(doc) = ws.documents.get(origin) else {
+        return BTreeMap::new();
+    };
+    let before = doc
+        .syntax
+        .commands
+        .partition_point(|command| command.span.start < offset);
+    if before > 0 && offset < doc.syntax.commands[before - 1].span.end {
+        // Static hook fields cannot contain a control word. Reject a cursor
+        // inside its spelling before constructing any project interpretation;
+        // named calls and forwarders still use the full analysis in fields.
+        return BTreeMap::new();
+    }
     if !ws.index_truncated.is_empty()
         || !ws.documents.values().any(|doc| {
             doc.kind == DocumentKind::Latex
@@ -131,4 +145,27 @@ pub(super) fn index<E: Clone + Eq>(
         result.insert(uri, entries);
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ordinary_control_words_do_not_construct_hook_interpretations() {
+        let uri = Url::parse("untitled:ordinary.tex").unwrap();
+        let source = r"\AtBeginDocument{Code}\maketitle";
+        let mut ws = Workspace::default();
+        ws.documents
+            .insert(uri.clone(), Document::new(&uri, source.into(), Some(1)));
+        let entries = index::<()>(
+            &ws,
+            &uri,
+            source.find("maketitle").unwrap() + 2,
+            &["AtBeginDocument"],
+            |_, _| panic!("ordinary command entered hook analysis"),
+            |_| true,
+        );
+        assert!(entries.is_empty());
+    }
 }

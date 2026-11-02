@@ -1725,10 +1725,9 @@ impl<'a> CommandSignatures<'a> {
     }
 
     pub(crate) fn invokes_builtin(&self, name: &str, builtin: &str) -> bool {
-        !self.local.contains_key(builtin)
-            && self.local.get(name).map_or(name == builtin, |signature| {
-                signature.as_ref().is_some_and(|s| s.name == builtin)
-            })
+        self.local.get(name).map_or(name == builtin, |signature| {
+            signature.as_ref().is_some_and(|s| s.name == builtin)
+        }) && !self.local.contains_key(builtin)
     }
 
     /// A unique replacement, including a late-bound pure forwarder, has a

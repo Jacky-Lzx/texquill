@@ -22,6 +22,7 @@ pub(crate) struct Cache {
     named: Named,
     labels: Labels,
     signatures: Signatures,
+    source_signatures: Signatures,
     bytes: usize,
 }
 
@@ -134,6 +135,37 @@ pub(crate) fn project_signatures<'a>(
     } else {
         signatures(workspace, scope, || build().into_owned())
     }
+}
+
+/// Source execution uses a filtered grammar, distinct from editing signatures.
+/// Reuse it only while the workspace is immutable, under the same byte budget.
+pub(crate) fn source_signatures(
+    workspace: &Workspace,
+    scope: &BTreeSet<Url>,
+) -> Arc<CommandSignatures<'static>> {
+    let build = || {
+        CommandSignatures::source_context(
+            scope
+                .iter()
+                .filter_map(|uri| workspace.documents.get(uri))
+                .filter(|doc| doc.kind == DocumentKind::Latex)
+                .map(|doc| (doc.text.source.as_str(), &doc.syntax)),
+        )
+    };
+    let Some(context) = AnalysisContext::current_query() else {
+        return Arc::new(build().into_owned());
+    };
+    let key_bytes = scope
+        .iter()
+        .map(|uri| uri.as_str().len() + 64)
+        .sum::<usize>();
+    shared(
+        &context,
+        (workspace as *const Workspace as usize, scope.clone()),
+        |cache| &mut cache.source_signatures,
+        || build().into_owned(),
+        |signatures| signatures.cache_bytes().saturating_add(key_bytes),
+    )
 }
 
 #[cfg(test)]
@@ -360,6 +392,54 @@ mod tests {
             assert!(!Arc::ptr_eq(
                 &first,
                 &project_signatures(&workspace, &scope)
+            ));
+        });
+    }
+
+    #[test]
+    fn source_signature_queries_keep_filtered_meanings_separate_and_refresh_inputs() {
+        let uri = Url::parse("untitled:source-signatures.tex").unwrap();
+        let provider = Url::parse("untitled:provider.tex").unwrap();
+        let mut workspace = Workspace::default();
+        document(
+            &mut workspace,
+            &uri,
+            r"\def\install{\def\input#1{}}\input{child}",
+        );
+        document(&mut workspace, &provider, r"\def\input#1{}");
+        let scope = BTreeSet::from([uri.clone()]);
+        let both = BTreeSet::from([uri.clone(), provider.clone()]);
+        let retained = with_cache(|| {
+            let source = source_signatures(&workspace, &scope);
+            assert!(source.command_unchanged("input"));
+            assert!(Arc::ptr_eq(&source, &source_signatures(&workspace, &scope)));
+            assert!(!project_signatures(&workspace, &scope).command_unchanged("input"));
+            assert!(!source_signatures(&workspace, &both).command_unchanged("input"));
+            let mut other = workspace.clone();
+            document(&mut other, &provider, "No override");
+            assert!(source_signatures(&other, &both).command_unchanged("input"));
+            source
+        });
+        document(&mut workspace, &uri, r"\def\input#1{}\input{child}");
+        with_cache(|| {
+            let current = source_signatures(&workspace, &scope);
+            assert!(!Arc::ptr_eq(&current, &retained));
+            assert!(!current.command_unchanged("input"));
+        });
+        assert!(retained.command_unchanged("input"));
+        assert!(!Arc::ptr_eq(
+            &source_signatures(&workspace, &scope),
+            &source_signatures(&workspace, &scope)
+        ));
+        with_cache(|| {
+            AnalysisContext::current_query()
+                .unwrap()
+                .symbols
+                .borrow_mut()
+                .bytes = MAX_BYTES;
+            assert!(!Arc::ptr_eq(
+                &source_signatures(&workspace, &scope),
+                &source_signatures(&workspace, &scope)
             ));
         });
     }

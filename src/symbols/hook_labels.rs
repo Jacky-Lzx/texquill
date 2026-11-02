@@ -253,7 +253,7 @@ struct Index {
 impl Index {
     fn new(ws: &Workspace, uri: &Url, offset: usize, complete: bool) -> Self {
         Self {
-            entries: super::hook_fields::index(ws, uri, COMMANDS, calls, |entry| {
+            entries: super::hook_fields::index(ws, uri, offset, COMMANDS, calls, |entry| {
                 entry.contains(offset, complete)
             }),
         }

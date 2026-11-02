@@ -333,6 +333,29 @@ fn group_mode(
     comments: bool,
     nested_delimiters: bool,
 ) -> Option<(Argument, usize)> {
+    if source.as_bytes().get(i) != Some(&open) {
+        return None;
+    }
+    let Some(context) = crate::analysis::AnalysisContext::current() else {
+        return uncached_group_mode(source, i, open, close, comments, nested_delimiters);
+    };
+    let key = super::group_cache::Key::new(source, i, open, close, comments, nested_delimiters);
+    if let Some(result) = context.groups.borrow().get(key, source) {
+        return Some(result);
+    }
+    let result = uncached_group_mode(source, i, open, close, comments, nested_delimiters)?;
+    context.groups.borrow_mut().insert(key, &result);
+    Some(result)
+}
+
+fn uncached_group_mode(
+    source: &str,
+    i: usize,
+    open: u8,
+    close: u8,
+    comments: bool,
+    nested_delimiters: bool,
+) -> Option<(Argument, usize)> {
     let bytes = source.as_bytes();
     if bytes.get(i) != Some(&open) {
         return None;
@@ -3782,6 +3805,68 @@ pub fn trimmed_span(source: &str, span: Range<usize>) -> Range<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cached_groups_preserve_each_reader_mode_and_unicode_boundaries() {
+        crate::analysis::AnalysisContext::lexical().run(|_| {
+            for source in [
+                "{中😀{nested}\\}tail}",
+                "{a% } ignored\r\n b}",
+                "[a[b]{c]d}e]tail",
+                "(a{b)c}d)tail",
+                "{unfinished\\}",
+                "[unfinished{]",
+                "{\\\\}tail",
+            ] {
+                for (at, _) in source.char_indices() {
+                    for (open, close) in [(b'{', b'}'), (b'[', b']'), (b'(', b')')] {
+                        for comments in [false, true] {
+                            for nested in [false, true] {
+                                let view = |value: Option<(Argument, usize)>| {
+                                    value.map(|(a, end)| (a.value, a.span, a.outer_span, end))
+                                };
+                                let expected = view(uncached_group_mode(
+                                    source, at, open, close, comments, nested,
+                                ));
+                                for _ in 0..2 {
+                                    assert_eq!(
+                                        view(group_mode(source, at, open, close, comments, nested)),
+                                        expected,
+                                        "{source:?}, {at}, {comments}, {nested}"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn lexical_groups_recheck_reused_scratch_storage_and_incomplete_reads() {
+        crate::analysis::AnalysisContext::lexical().run(|_| {
+            let mut source = String::with_capacity(64);
+            let pointer = source.as_ptr();
+            for (text, value) in [
+                ("{abc}tail", Some("abc")),
+                ("{a}c}tail", Some("a")),
+                ("{a{c}tail", None),
+                ("{abc}tail", Some("abc")),
+                ("[abc]tail", None),
+            ] {
+                source.clear();
+                source.push_str(text);
+                assert_eq!(source.as_ptr(), pointer);
+                assert_eq!(
+                    group(&source, 0, b'{', b'}')
+                        .map(|(a, _)| a.value)
+                        .as_deref(),
+                    value
+                );
+            }
+        });
+    }
 
     #[test]
     fn comments_escapes_and_verbatim_are_opaque() {

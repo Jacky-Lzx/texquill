@@ -1328,8 +1328,10 @@ impl Workspace {
     }
 
     pub fn load_dependencies(&mut self, uri: &Url, depth: usize) {
-        self.load_dependencies_inner(uri, uri, depth, &mut BTreeSet::new(), false, &mut None);
-        self.refresh_context();
+        crate::analysis::AnalysisContext::lexical().run(|_| {
+            self.load_dependencies_inner(uri, uri, depth, &mut BTreeSet::new(), false, &mut None);
+            self.refresh_context();
+        });
     }
 
     /// Reload each saved dependency before walking its includes: closed child
@@ -1390,11 +1392,16 @@ impl Workspace {
                     continue;
                 }
                 if let Some(kind) = sources.get(&dependency) {
-                    if let Some(doc) = self.documents.get_mut(&dependency) {
+                    if let Some(doc) = self.documents.get(&dependency) {
                         if doc.kind != *kind {
                             *inputs = None;
                         }
-                        doc.set_kind_hint(*kind);
+                        if doc.kind != *kind || doc.kind_hint != Some(*kind) {
+                            self.documents
+                                .get_mut(&dependency)
+                                .unwrap()
+                                .set_kind_hint(*kind);
+                        }
                     } else {
                         self.reload_document_as(&dependency, true, Some(*kind));
                         *inputs = None;

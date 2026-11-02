@@ -21,6 +21,7 @@ const CUSTOM: u8 = 4;
 const UNKNOWN: u8 = ONE | TWO | CUSTOM;
 
 const MAX_CACHED_BYTES: usize = 16 * 1024 * 1024;
+const MAX_SOURCE_INTERPRETATIONS: usize = 4;
 static CACHED_BYTES: AtomicUsize = AtomicUsize::new(0);
 
 /// Text is owned by the Document; readers and inherited grammar distinguish
@@ -66,9 +67,12 @@ pub(crate) struct Cache {
 impl Cache {
     fn source(doc: &crate::project::workspace::Document, inputs: SourceInputs) -> Arc<Source> {
         {
-            let sources = doc.string_context.sources.lock().unwrap();
-            if let Some(cached) = sources.iter().find(|cached| cached.inputs == inputs) {
-                return cached.source.clone();
+            let mut sources = doc.string_context.sources.lock().unwrap();
+            if let Some(at) = sources.iter().position(|cached| cached.inputs == inputs) {
+                let cached = sources.remove(at).unwrap();
+                let source = cached.source.clone();
+                sources.push_back(cached);
+                return source;
             }
         }
         let source = Arc::new(Source::new(
@@ -89,8 +93,10 @@ impl Cache {
             &inputs.readers,
             &inputs.stored,
         ));
-        // Account conservatively for syntax and interpretation storage. Each
-        // document keeps at most two interpretations; the process has a budget.
+        // Account conservatively for syntax and interpretation storage. Keep
+        // the literal, inherited and converging fixed-point grammars of a
+        // document together. Alternating between them must not evict the parse
+        // needed on every edit; the process-wide byte budget still applies.
         let bytes = doc
             .text
             .source
@@ -115,7 +121,7 @@ impl Cache {
                     .sum::<usize>(),
             );
         let mut sources = doc.string_context.sources.lock().unwrap();
-        if sources.len() >= 2 {
+        if sources.len() >= MAX_SOURCE_INTERPRETATIONS {
             sources.pop_front();
         }
         if CACHED_BYTES
@@ -1097,6 +1103,47 @@ pub(crate) fn refresh(workspace: &mut Workspace) {
 mod tests {
     use super::*;
     use crate::project::workspace::Document;
+
+    #[test]
+    fn alternating_fixed_point_grammars_retain_parses_and_evict_the_least_recent() {
+        let uri = Url::parse("untitled:grammars.tex").unwrap();
+        let doc = Document::new(&uri, r"\ifstrempty{A}{B}{C}".into(), Some(1));
+        let inputs: Vec<_> = [ONE, TWO, CUSTOM, UNKNOWN]
+            .into_iter()
+            .map(|meaning| {
+                let mut inputs = SourceInputs::default();
+                inputs.meanings.insert(0, meaning);
+                inputs
+            })
+            .collect();
+        let retained: Vec<_> = inputs
+            .iter()
+            .map(|inputs| Cache::source(&doc, inputs.clone()))
+            .collect();
+        for _ in 0..3 {
+            for (inputs, source) in inputs.iter().zip(&retained) {
+                assert!(Arc::ptr_eq(source, &Cache::source(&doc, inputs.clone())));
+            }
+        }
+        // Promote the oldest entry, then force one eviction with a fifth input.
+        assert!(Arc::ptr_eq(
+            &retained[0],
+            &Cache::source(&doc, inputs[0].clone())
+        ));
+        Cache::source(&doc, SourceInputs::default());
+        assert_eq!(
+            doc.string_context.sources.lock().unwrap().len(),
+            MAX_SOURCE_INTERPRETATIONS
+        );
+        assert!(Arc::ptr_eq(
+            &retained[0],
+            &Cache::source(&doc, inputs[0].clone())
+        ));
+        assert!(!Arc::ptr_eq(
+            &retained[1],
+            &Cache::source(&doc, inputs[1].clone())
+        ));
+    }
 
     #[test]
     fn unrelated_edits_retain_parses_and_tokens_but_imported_meanings_invalidate_them() {

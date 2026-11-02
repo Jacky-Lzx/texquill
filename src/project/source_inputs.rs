@@ -3,7 +3,10 @@ use crate::analysis::AnalysisContext;
 use crate::{
     parser::syntax,
     project::workspace::{resolve_file_path, DocumentKind, Workspace},
-    symbols::commands::{CommandSignatures, SourceCall},
+    symbols::{
+        commands::{CommandSignatures, SourceCall},
+        query_cache::source_signatures,
+    },
 };
 use lsp_types::Url;
 use std::collections::{BTreeMap, BTreeSet};
@@ -62,6 +65,10 @@ pub(crate) struct Index {
     pub incomplete: bool,
     literal: Option<BTreeMap<Url, Vec<Url>>>,
     context: BTreeSet<Url>,
+    signatures: Option<(
+        super::documents::Revisions,
+        std::sync::Arc<CommandSignatures<'static>>,
+    )>,
 }
 
 impl Index {
@@ -99,12 +106,7 @@ impl Index {
             if index.incomplete || !seen.insert(scope.clone()) {
                 break;
             }
-            let signatures = CommandSignatures::source_context(scope.iter().filter_map(|uri| {
-                workspace.documents.get(uri).and_then(|doc| {
-                    (doc.kind == DocumentKind::Latex)
-                        .then_some((doc.text.source.as_str(), &doc.syntax))
-                })
-            }));
+            let signatures = source_signatures(workspace, &scope);
             let mut literal = BTreeMap::new();
             let mut loader_calls = BTreeMap::new();
             let mut forwarders = BTreeMap::new();
@@ -214,6 +216,14 @@ impl Index {
             index.literal = Some(literal);
             let next = index.scope(workspace, root);
             if !index.incomplete && next == scope {
+                // Loading dependencies mutates the workspace between reads, so
+                // it cannot use a workspace query cache. Keep this pure source
+                // grammar only while every document revision still agrees.
+                if AnalysisContext::current_query().is_none()
+                    && signatures.cache_bytes() <= 8 * 1024 * 1024
+                {
+                    index.signatures = Some((workspace.documents.revisions(), signatures));
+                }
                 index.context = scope;
                 return index;
             }
@@ -233,7 +243,21 @@ impl Index {
             incomplete: true,
             literal: None,
             context: BTreeSet::new(),
+            signatures: None,
         }
+    }
+
+    fn source_signatures(
+        &self,
+        workspace: &Workspace,
+        scope: &BTreeSet<Url>,
+    ) -> std::sync::Arc<CommandSignatures<'static>> {
+        if let Some((revisions, signatures)) = &self.signatures {
+            if *scope == self.context && revisions.current(&workspace.documents) {
+                return signatures.clone();
+            }
+        }
+        source_signatures(workspace, scope)
     }
 
     /// Potential literal source paths retain unknown and deferred execution,
@@ -342,11 +366,7 @@ impl Index {
         let Some(doc) = workspace.documents.get(uri) else {
             return BTreeSet::new();
         };
-        let signatures = CommandSignatures::source_context(
-            documents
-                .iter()
-                .map(|(_, doc)| (doc.text.source.as_str(), &doc.syntax)),
-        );
+        let signatures = self.source_signatures(workspace, &scope);
         // Potential input in deferred code or a macro operand may execute a
         // provider which the active graph could not inspect. Retokenization
         // and displayed-code APIs can also execute otherwise opaque input.
@@ -487,11 +507,7 @@ pub(crate) fn selection_filters(
     scope: &BTreeSet<Url>,
 ) -> Option<Vec<BTreeSet<String>>> {
     let documents = bounded_latex_sources(workspace, scope)?;
-    let signatures = CommandSignatures::source_context(
-        documents
-            .iter()
-            .map(|(_, doc)| (doc.text.source.as_str(), &doc.syntax)),
-    );
+    let signatures = source_signatures(workspace, scope);
     let mut filters = Vec::new();
     for (_, doc) in documents {
         filters.extend(signatures.selection_filters(&doc.text.source, &doc.syntax)?);
@@ -524,11 +540,7 @@ fn direct_file_positions(
     let Some(documents) = bounded_latex_sources(workspace, scope) else {
         return BTreeMap::new();
     };
-    let signatures = CommandSignatures::source_context(
-        documents
-            .iter()
-            .map(|(_, doc)| (doc.text.source.as_str(), &doc.syntax)),
-    );
+    let signatures = source_signatures(workspace, scope);
     documents
         .into_iter()
         .map(|(uri, doc)| {
@@ -593,11 +605,7 @@ pub(crate) fn editable_file_positions(
     let Some(documents) = bounded_latex_sources(workspace, scope) else {
         return BTreeMap::new();
     };
-    let signatures = CommandSignatures::source_context(
-        documents
-            .iter()
-            .map(|(_, doc)| (doc.text.source.as_str(), &doc.syntax)),
-    );
+    let signatures = source_signatures(workspace, scope);
     documents
         .into_iter()
         .map(|(uri, doc)| {
@@ -697,6 +705,33 @@ fn resource_targets(
 mod selection_filter_tests {
     use super::*;
     use crate::project::workspace::Document;
+
+    #[test]
+    fn traversal_signatures_reuse_only_current_revisions_and_the_exact_source_scope() {
+        let uri = Url::parse("untitled:traversal.tex").unwrap();
+        let mut workspace = Workspace::default();
+        workspace.documents.insert(
+            uri.clone(),
+            Document::new(&uri, r"\def\forward{\input}".into(), Some(1)),
+        );
+        let index = Index::new(&workspace, &uri);
+        let scope = BTreeSet::from([uri.clone()]);
+        let first = index.source_signatures(&workspace, &scope);
+        assert!(std::sync::Arc::ptr_eq(
+            &first,
+            &index.source_signatures(&workspace, &scope)
+        ));
+        assert_eq!(first.forwarded_builtin("forward"), Some("input"));
+        assert!(index
+            .source_signatures(&workspace, &BTreeSet::new())
+            .command_unchanged("forward"));
+        *workspace.documents.get_mut(&uri).unwrap() =
+            Document::new(&uri, r"\def\forward{\include}".into(), Some(2));
+        let changed = index.source_signatures(&workspace, &scope);
+        assert!(!std::sync::Arc::ptr_eq(&first, &changed));
+        assert_eq!(changed.forwarded_builtin("forward"), Some("include"));
+        assert_eq!(first.forwarded_builtin("forward"), Some("input"));
+    }
 
     #[test]
     fn query_graphs_do_not_survive_document_or_filesystem_changes() {

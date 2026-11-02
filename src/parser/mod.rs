@@ -2,6 +2,7 @@
 
 pub(crate) mod delimiter_operands;
 pub(crate) mod fancyvrb;
+pub(crate) mod group_cache;
 pub(crate) mod listings;
 pub(crate) mod minted;
 pub(crate) mod right_delimiters;
