@@ -1623,11 +1623,35 @@ fn completion_in_query(
     let use_snippets = workspace.client.snippets
         && !doc.syntax.control_operands.contains(&(line_start + slash))
         && !doc.text.source[after_command..].starts_with(['{', '[', '*']);
+    command_items(
+        workspace,
+        uri,
+        &scope,
+        prefix,
+        &doc.text.source[command_end..],
+        range,
+        allow_math,
+        use_snippets,
+        workspace.completion_budget(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn command_items(
+    workspace: &Workspace,
+    uri: &Url,
+    scope: &BTreeSet<Url>,
+    prefix: &str,
+    following: &str,
+    range: lsp_types::Range,
+    allow_math: bool,
+    use_snippets: bool,
+    limit: usize,
+) -> Vec<CompletionItem> {
     let mut seen = BTreeSet::new();
     let mut result = Vec::new();
-    let limit = workspace.completion_budget();
-    let signatures = crate::language::signature::CompletionSignatures::new(workspace, &scope);
-    let command_docs = crate::language::completion_resolve::Commands::new(workspace, uri, &scope);
+    let signatures = crate::language::signature::CompletionSignatures::new(workspace, scope);
+    let command_docs = crate::language::completion_resolve::Commands::new(workspace, uri, scope);
     // User definitions take precedence over built-in documentation and snippets.
     for (entry, is_command) in workspace
         .documents
@@ -1650,7 +1674,7 @@ fn completion_in_query(
         })
     {
         if entry.name.starts_with(prefix) && seen.insert(entry.name.clone()) {
-            let signature = signatures.at(&entry.name, &doc.text.source[command_end..]);
+            let signature = signatures.at(&entry.name, following);
             let snippet = signature
                 .as_ref()
                 .and_then(|(_, snippet)| snippet.as_ref())
@@ -1728,7 +1752,7 @@ fn completion_in_query(
             }
         }
     }
-    let loaded_packages = crate::project::packages::loaded(workspace, &scope);
+    let loaded_packages = crate::project::packages::loaded(workspace, scope);
     for package in crate::project::packages::catalog()
         .iter()
         .filter(|package| loaded_packages.contains(&package.name))
@@ -1740,7 +1764,7 @@ fn completion_in_query(
             if !command.name.starts_with(prefix) || !seen.insert(command.name.clone()) {
                 continue;
             }
-            let signature = signatures.at(&command.name, &doc.text.source[command_end..]);
+            let signature = signatures.at(&command.name, following);
             let snippet = signature
                 .as_ref()
                 .and_then(|(_, snippet)| snippet.as_ref())
@@ -1774,14 +1798,11 @@ fn completion_in_query(
         }
         if name.starts_with(prefix) && seen.insert(name.into()) {
             let builtin_arguments = name != "thefield"
-                || crate::symbols::commands::uses_builtin(workspace, name, &scope);
+                || crate::symbols::commands::uses_builtin(workspace, name, scope);
             let use_snippets = use_snippets
                 && builtin_arguments
                 && !crate::language::signature::has_existing_arguments(
-                    workspace,
-                    name,
-                    &scope,
-                    &doc.text.source[command_end..],
+                    workspace, name, scope, following,
                 );
             result.push(CompletionItem {
                 label: name.into(),

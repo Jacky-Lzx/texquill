@@ -18,7 +18,7 @@ struct Identity {
     fingerprint: String,
 }
 
-fn fingerprint(ws: &Workspace, scope: &BTreeSet<Url>) -> String {
+pub(super) fn fingerprint(ws: &Workspace, scope: &BTreeSet<Url>) -> String {
     let mut hash = std::collections::hash_map::DefaultHasher::new();
     ws.index_truncated.hash(&mut hash);
     for uri in scope {

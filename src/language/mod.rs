@@ -3,6 +3,7 @@
 pub(crate) mod call_hierarchy;
 pub mod code_lens;
 pub mod colors;
+pub(crate) mod completion_cache;
 pub(crate) mod completion_resolve;
 pub(crate) mod display;
 pub mod features;

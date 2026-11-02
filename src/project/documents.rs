@@ -33,6 +33,9 @@ pub type Iter<'a> = std::iter::Map<
 >;
 
 impl Documents {
+    pub(crate) fn weak_revisions(&self) -> Vec<(Url, Weak<Document>)> {
+        self.revisions().0
+    }
     pub(crate) fn revisions(&self) -> Revisions {
         Revisions(
             self.0

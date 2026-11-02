@@ -63,6 +63,10 @@ impl<'a> CompletionSignatures<'a> {
         }
     }
 
+    pub(super) fn resolved(&self, name: &str) -> Option<Signature> {
+        lookup(self.workspace, name, false, self.scope, Some(&self.aliases))
+    }
+
     pub(crate) fn at(&self, name: &str, following: &str) -> Option<(String, Option<String>)> {
         let signature = lookup(self.workspace, name, false, self.scope, Some(&self.aliases))?;
         if existing_arguments(&signature, following) {
@@ -146,7 +150,7 @@ pub(crate) fn has_existing_arguments(
         .is_some_and(|signature| existing_arguments(&signature, following))
 }
 
-fn existing_arguments(signature: &Signature, following: &str) -> bool {
+pub(super) fn existing_arguments(signature: &Signature, following: &str) -> bool {
     let ungrouped_argument = completion_required_token(following);
     let following = &following[syntax::skip_space(following, 0)..];
     // The same argument reader decides whether existing custom delimiters must

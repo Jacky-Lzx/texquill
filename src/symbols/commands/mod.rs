@@ -1756,6 +1756,47 @@ impl<'a> CommandSignatures<'a> {
         shape.parameter_spans(source, parsed, invocation, control_spaces)
     }
 
+    /// Preserve every grammar agreed by duplicate declarations, including
+    /// differently documented definitions with identical parameter readers.
+    pub(crate) fn completion_shapes(&self) -> BTreeMap<String, Option<CommandShape>> {
+        let mut result: BTreeMap<_, _> = self
+            .common_parameter_grammars()
+            .into_iter()
+            .map(|(name, operands)| {
+                let shape = match operands {
+                    Some(LiteralOperands::Signature(signature)) => Some(CommandShape {
+                        signature: Some(signature),
+                        tex: None,
+                    }),
+                    Some(LiteralOperands::Tex(tex)) => Some(CommandShape {
+                        signature: None,
+                        tex: Some(tex),
+                    }),
+                    _ => None,
+                };
+                (name.into_owned(), shape)
+            })
+            .collect();
+        for name in COMMANDS
+            .iter()
+            .map(|entry| entry.0)
+            .chain(crate::project::catalog::PRIMITIVES.iter().copied())
+        {
+            if !result.contains_key(name) {
+                if let Some(signature) = operand_builtin(name) {
+                    result.insert(
+                        name.to_owned(),
+                        Some(CommandShape {
+                            signature: Some(signature),
+                            tex: None,
+                        }),
+                    );
+                }
+            }
+        }
+        result
+    }
+
     pub(crate) fn hook_signature(
         &self,
         name: &str,

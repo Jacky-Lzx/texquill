@@ -2,6 +2,7 @@
 
 mod backend;
 pub mod client;
+mod completion;
 pub mod dispatch;
 pub mod protocol;
 pub(crate) mod queries;

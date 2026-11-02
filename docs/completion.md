@@ -4,6 +4,14 @@
 
 Supports common LaTeX commands, environments, in-project user commands, cross-file labels, BibTeX entry types, field names, string abbreviations and citation keys, as well as paths to input files, images and local packages. Supports mid-word substitution; when optional parameters of references and paths contain nested commands, the current key name or file parameter can still be found.
 
+Ordinary command candidates are prepared in the background when a LaTeX buffer
+opens. Eligible prose, comment and command-prefix edits reuse those templates;
+replacement ranges and snippet decisions still use the current text. Macro,
+dependency, documentation and settings changes invalidate affected preparation.
+Cold requests, complex parameter readers, literal regions and unsupported
+contexts use the full contextual analysis. Label, citation and path providers
+retain their existing context checks. No editor configuration change is needed.
+
 Math-only commands from the built-in catalog and loaded packages (such as `alpha`, `frac`, and `dfrac`) are completed only in math mode. The server recognizes `$…$`, `$$…$$`, `\(…\)`, `\[…\]`, `ensuremath`, and common math environments; text arguments such as `text` and `mbox` inside formulas restore text mode. Comments, verbatim content, escaped symbols, and unexpanded command-name operands do not change the mode. User definitions retain priority, and math commands remain available when declaring, copying, or inspecting command names. This check uses static syntax in the current file; it does not expand macros or infer math mode for custom environments.
 
 biblatex's `citefield` / `printfield`, `citelist` / `printlist`, `citename` / `printnames` also completes common output fields, literal lists or name list names by parameter type, and provides hover instructions; see [biblatex Data Access](biblatex.md#fields-lists-and-name-references).

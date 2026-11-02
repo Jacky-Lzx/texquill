@@ -73,9 +73,16 @@ pub struct Backend {
     external_tasks: tasks::Tasks,
     queries: queries::Queries,
     shutdown_requested: AtomicBool,
-    pending_change_publish: AtomicBool,
+    pending_change_publish: Arc<AtomicBool>,
+    completion: super::completion::Completion,
     semantic_cache: Mutex<semantic_cache::Cache>,
     diagnostic_cache: Arc<Mutex<diagnostic::Cache>>,
+}
+
+impl Drop for Backend {
+    fn drop(&mut self) {
+        self.completion.close();
+    }
 }
 
 impl Backend {
@@ -89,7 +96,8 @@ impl Backend {
             client,
             workspace,
             shutdown_requested: AtomicBool::new(false),
-            pending_change_publish: AtomicBool::new(false),
+            pending_change_publish: Arc::new(AtomicBool::new(false)),
+            completion: Default::default(),
             semantic_cache: Mutex::new(semantic_cache::Cache::default()),
             diagnostic_cache: Arc::new(Mutex::new(diagnostic::Cache::default())),
         }
@@ -102,6 +110,7 @@ impl Backend {
         let external_tasks = self.external_tasks.clone();
         let workspace = self.workspace.clone();
         let analysis = self.queries.clone();
+        self.completion.close();
         async move {
             tokio::join!(
                 queries.shutdown(),
@@ -154,6 +163,7 @@ impl Backend {
         if self.workspace.obsolete_background_inputs().await {
             return Err(content_modified());
         }
+        self.wait_prepared_inputs().await?;
         let (workspace, revision) = {
             let workspace = self.workspace.read().await;
             (workspace.clone(), self.workspace.revision())
@@ -408,8 +418,42 @@ impl Backend {
         self.publish_open().await;
     }
 
+    fn prepare_completion(&self) {
+        self.completion.schedule(
+            self.workspace.clone(),
+            self.queries.clone(),
+            self.client.clone(),
+            self.pending_change_publish.clone(),
+            false,
+            None,
+        );
+    }
+
+    async fn wait_prepared_inputs(&self) -> Result<()> {
+        let source = self.workspace.source_revision();
+        loop {
+            let changed = self.workspace.update_signal();
+            let inputs = self.workspace.read_unindexed().await;
+            if self.workspace.source_revision() != source {
+                return Err(content_modified());
+            }
+            if !inputs.has_pending_dependencies()
+                || !inputs.diagnostic_delivery.supports_refresh()
+                || !self
+                    .completion
+                    .covers(&inputs, self.workspace.completion_epoch())
+            {
+                return Ok(());
+            }
+            drop(inputs);
+            dispatch::release();
+            changed.await;
+        }
+    }
+
     async fn publish_open(&self) {
         self.publish_affected(Default::default()).await;
+        self.prepare_completion();
     }
 
     async fn diagnostic_reports(
@@ -891,10 +935,19 @@ impl Backend {
 
     pub(crate) async fn did_open(&self, params: DidOpenTextDocumentParams) {
         let item = params.text_document;
+        let origin = item.uri.clone();
         let mut workspace = self.workspace.write().await;
         workspace.open_with_language(item.uri, item.text, item.version, &item.language_id);
         drop(workspace);
         self.publish_open().await;
+        self.completion.schedule(
+            self.workspace.clone(),
+            self.queries.clone(),
+            self.client.clone(),
+            self.pending_change_publish.clone(),
+            true,
+            Some(origin),
+        );
     }
 
     pub(crate) async fn did_change(&self, params: DidChangeTextDocumentParams) {
@@ -938,7 +991,17 @@ impl Backend {
         if self.workspace.has_queued_changes() {
             return;
         }
-        let mut workspace = self.workspace.write_changes().await;
+        let mut workspace = self.workspace.write_prepared().await;
+        if workspace.has_pending_dependencies()
+            && workspace.diagnostic_delivery.supports_refresh()
+            && self
+                .completion
+                .covers(&workspace, self.workspace.completion_epoch())
+        {
+            drop(workspace);
+            self.prepare_completion();
+            return;
+        }
         if workspace.has_pending_dependencies() {
             workspace.refresh_pending_dependencies();
         }
@@ -1258,6 +1321,9 @@ impl Backend {
         if self.workspace.obsolete_diagnostic_inputs().await {
             return Err(diagnostic_modified());
         }
+        self.wait_prepared_inputs()
+            .await
+            .map_err(|_| diagnostic_modified())?;
         let uri = document_uri(params.text_document.uri);
         let workspace = self.workspace.clone().read_owned().await;
         let previous = params
@@ -1295,6 +1361,9 @@ impl Backend {
         if self.workspace.obsolete_diagnostic_inputs().await {
             return Err(diagnostic_modified());
         }
+        self.wait_prepared_inputs()
+            .await
+            .map_err(|_| diagnostic_modified())?;
         let previous: std::collections::BTreeMap<_, _> = params
             .previous_result_ids
             .into_iter()
@@ -1446,6 +1515,38 @@ impl Backend {
         &self,
         params: CompletionParams,
     ) -> Result<Option<CompletionResponse>> {
+        {
+            let position = &params.text_document_position;
+            let workspace = self.workspace.read_unindexed().await;
+            if let Some(items) = self.completion.complete(
+                &workspace,
+                self.workspace.completion_epoch(),
+                &document_uri(position.text_document.uri.clone()),
+                position.position,
+            ) {
+                let limit = workspace.config.indexing.completion_limit;
+                let incomplete = items.len() >= limit;
+                let items = items.into_iter().take(limit).collect();
+                return Ok(Some(if incomplete {
+                    CompletionResponse::List(CompletionList {
+                        is_incomplete: true,
+                        items,
+                    })
+                } else {
+                    CompletionResponse::Array(items)
+                }));
+            }
+        }
+        self.completion.schedule(
+            self.workspace.clone(),
+            self.queries.clone(),
+            self.client.clone(),
+            self.pending_change_publish.clone(),
+            false,
+            Some(document_uri(
+                params.text_document_position.text_document.uri.clone(),
+            )),
+        );
         self.read_query(move |workspace| {
             let position = params.text_document_position;
             let mut items = features::completion(
@@ -1827,6 +1928,150 @@ mod read_query_tests {
     use super::*;
     use std::time::Duration;
     use tokio::sync::oneshot;
+
+    #[tokio::test]
+    async fn prepared_completion_overtakes_waiting_views_without_serving_old_source_positions() {
+        let (client, _outgoing) = Client::new();
+        let backend = Arc::new(Backend::new(client));
+        let uri = Url::parse("untitled:prepared-dispatch.tex").unwrap();
+        let source = "\\documentclass{article}\n\\begin{document}\n\\inp\n\\end{document}\n";
+        {
+            let mut inputs = backend.workspace.write().await;
+            inputs.client.snippets = true;
+            inputs.diagnostic_delivery = diagnostic::Delivery::new(true, true);
+            inputs.documents.insert(
+                uri.clone(),
+                workspace::Document::new(&uri, source.into(), Some(1)),
+            );
+        }
+        backend.completion.schedule(
+            backend.workspace.clone(),
+            backend.queries.clone(),
+            backend.client.clone(),
+            backend.pending_change_publish.clone(),
+            true,
+            Some(uri.clone()),
+        );
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let inputs = backend.workspace.read_unindexed().await;
+                let position = inputs.documents[&uri]
+                    .text
+                    .position(source.find("\\inp").unwrap() + 4);
+                if backend
+                    .completion
+                    .complete(
+                        &inputs,
+                        backend.workspace.completion_epoch(),
+                        &uri,
+                        position,
+                    )
+                    .is_some()
+                {
+                    break;
+                }
+                drop(inputs);
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("preparation did not finish");
+        let mut workers = Vec::new();
+        let mut finishes = Vec::new();
+        for _ in 0..3 {
+            let queries = backend.queries.clone();
+            let (started, start) = oneshot::channel();
+            let (finish, finished) = oneshot::channel();
+            workers.push(tokio::spawn(async move {
+                queries
+                    .run_background(move |_| {
+                        let _ = started.send(());
+                        let _ = finished.blocking_recv();
+                        Ok(())
+                    })
+                    .await
+            }));
+            start.await.unwrap();
+            finishes.push(finish);
+        }
+        let current = source.replace("\\inp", "% moved 😀\n\\inp");
+        backend
+            .did_change(
+                serde_json::from_value(serde_json::json!({
+                    "textDocument":{"uri":uri,"version":2},"contentChanges":[{"text":current}]
+                }))
+                .unwrap(),
+            )
+            .await;
+        let mut queue = dispatch::RequestQueue::default();
+        let background = backend.clone();
+        let view_uri = uri.clone();
+        let view = tokio::spawn(queue.ordered(async move {
+            background
+                .read_background_query(move |ws| ws.documents[&view_uri].version)
+                .await
+        }));
+        let completion = backend.clone();
+        let position =
+            crate::text::Text::new(current.clone()).position(current.find("\\inp").unwrap() + 4);
+        let reply = tokio::time::timeout(
+            Duration::from_secs(1),
+            queue.ordered(async move {
+                completion
+                    .completion(
+                        serde_json::from_value(
+                            serde_json::json!({"textDocument":{"uri":uri},"position":position}),
+                        )
+                        .unwrap(),
+                    )
+                    .await
+            }),
+        )
+        .await;
+        let still_pending = backend
+            .workspace
+            .read_unindexed()
+            .await
+            .has_pending_dependencies();
+        assert_eq!(
+            backend
+                .read_query(|ws| ws.documents.values().find_map(|doc| doc.version))
+                .await
+                .unwrap(),
+            Some(2)
+        );
+        for finish in finishes {
+            let _ = finish.send(());
+        }
+        for worker in workers {
+            worker.await.unwrap().unwrap();
+        }
+        let reply = serde_json::to_value(
+            reply
+                .expect("completion waited for background refresh")
+                .unwrap(),
+        )
+        .unwrap();
+        let items = reply.as_array().unwrap();
+        let input = items.iter().find(|item| item["label"] == "input").unwrap();
+        assert_eq!(
+            input["textEdit"]["range"]["end"],
+            serde_json::to_value(position).unwrap()
+        );
+        assert!(
+            still_pending,
+            "prepared reply forced synchronous project refresh"
+        );
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(3), view)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap(),
+            Some(2)
+        );
+        backend.cleanup().await;
+    }
 
     #[tokio::test]
     async fn intermediate_pull_reports_only_skip_refreshable_clients() {

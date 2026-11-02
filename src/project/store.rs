@@ -12,6 +12,8 @@ pub struct WorkspaceUpdate<'a> {
     revision: &'a AtomicU64,
     updated: &'a Notify,
     changed: bool,
+    completion_epoch: Option<&'a AtomicU64>,
+    source_revision: Option<&'a AtomicU64>,
 }
 
 impl Deref for WorkspaceUpdate<'_> {
@@ -27,6 +29,12 @@ impl DerefMut for WorkspaceUpdate<'_> {
             self.revision.fetch_add(1, Ordering::SeqCst);
             self.changed = true;
             self.updated.notify_waiters();
+            if let Some(epoch) = self.completion_epoch {
+                epoch.fetch_add(1, Ordering::SeqCst);
+            }
+            if let Some(revision) = self.source_revision {
+                revision.fetch_add(1, Ordering::SeqCst);
+            }
         }
         &mut self.workspace
     }
@@ -38,6 +46,8 @@ pub struct WorkspaceStore {
     revision: Arc<AtomicU64>,
     updated: Arc<Notify>,
     queued_changes: Arc<AtomicUsize>,
+    completion_epoch: Arc<AtomicU64>,
+    source_revision: Arc<AtomicU64>,
 }
 
 /// Count notifications from receipt until their ordered handler completes,
@@ -57,6 +67,8 @@ impl WorkspaceStore {
             revision: Arc::default(),
             updated: Arc::default(),
             queued_changes: Arc::default(),
+            completion_epoch: Arc::default(),
+            source_revision: Arc::default(),
         }
     }
 
@@ -67,7 +79,9 @@ impl WorkspaceStore {
                 return workspace;
             }
             drop(workspace);
-            self.workspace.write().await.refresh_pending_dependencies();
+            if self.workspace.write().await.refresh_pending_dependencies() {
+                self.updated.notify_waiters();
+            }
         }
     }
 
@@ -78,7 +92,9 @@ impl WorkspaceStore {
                 return workspace;
             }
             drop(workspace);
-            self.workspace.write().await.refresh_pending_dependencies();
+            if self.workspace.write().await.refresh_pending_dependencies() {
+                self.updated.notify_waiters();
+            }
         }
     }
 
@@ -86,23 +102,57 @@ impl WorkspaceStore {
     /// reindexing replaces the entire Workspace value.
     pub async fn write(&self) -> WorkspaceUpdate<'_> {
         let mut workspace = self.workspace.write().await;
-        workspace.refresh_pending_dependencies();
-        self.update(workspace)
+        if workspace.refresh_pending_dependencies() {
+            self.updated.notify_waiters();
+        }
+        self.update(workspace, true, true)
     }
 
     /// Apply sequential edit ranges without forcing intermediate project
     /// refreshes. All ordinary readers and writers still observe fresh inputs.
     pub(crate) async fn write_changes(&self) -> WorkspaceUpdate<'_> {
-        self.update(self.workspace.write().await)
+        self.update(self.workspace.write().await, false, true)
     }
 
-    fn update<'a>(&'a self, workspace: RwLockWriteGuard<'a, Workspace>) -> WorkspaceUpdate<'a> {
+    /// Derived data only. Snapshot workers validate their source revision
+    /// before committing; propagation is not a new editor input or cache epoch.
+    pub(crate) async fn write_prepared(&self) -> WorkspaceUpdate<'_> {
+        self.update(self.workspace.write().await, false, false)
+    }
+
+    fn update<'a>(
+        &'a self,
+        workspace: RwLockWriteGuard<'a, Workspace>,
+        invalidate: bool,
+        source: bool,
+    ) -> WorkspaceUpdate<'a> {
         WorkspaceUpdate {
             workspace,
             revision: &self.revision,
             updated: &self.updated,
             changed: false,
+            completion_epoch: invalidate.then_some(&self.completion_epoch),
+            source_revision: source.then_some(&self.source_revision),
         }
+    }
+
+    /// Cache validation/preparation may inspect pending inputs. Ordinary
+    /// language queries must use a fresh guard or a certified prepared result.
+    pub(crate) async fn read_unindexed(&self) -> RwLockReadGuard<'_, Workspace> {
+        self.workspace.read().await
+    }
+
+    pub(crate) fn completion_epoch(&self) -> u64 {
+        self.completion_epoch.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn source_revision(&self) -> u64 {
+        self.source_revision.load(Ordering::SeqCst)
+    }
+
+    /// A synchronous reader can finish propagation without advancing revision.
+    pub(crate) fn update_signal(&self) -> impl std::future::Future<Output = ()> + '_ {
+        self.updated.notified()
     }
 
     pub(crate) fn queue_change(&self) -> QueuedChange {

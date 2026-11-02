@@ -66,6 +66,13 @@ records both settings. Compare final response latency after stopping typing;
 cancelled intermediate responses do not establish that queued source refreshes
 were also coalesced.
 
+Prepared command candidates can return before deferred project views finish.
+The benchmark measures completion at receipt, then separately waits for and
+compares all current background views. It starts typing without a fixed warmup;
+an editor check should also cover an already open buffer after preparation.
+Record the loaded server command in that editor check to distinguish the new
+binary from a running client that has not been restarted.
+
 ## Generated editing sessions
 
 By default, three sizes of deterministically generated projects are measured: small is 1 chapter and 16 sections per chapter; medium is 4 chapters and 32 sections per chapter; large is 8 chapters and 64 sections per chapter. Each project contains the main document, chapter files and BibTeX database. The text contains Chinese, emoji, mathematical environment, user macros, cross-file labels and citations. Projects are all below the default index budget; the test rejects index truncation.
