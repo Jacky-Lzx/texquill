@@ -275,6 +275,30 @@ pub(crate) struct SymbolProjects {
 }
 
 impl Workspace {
+    /// Immutable command/path completion inputs; diagnostic collections and
+    /// artifact history are unrelated to prepared completion validation.
+    pub(crate) fn completion_snapshot(&self) -> Self {
+        Self {
+            client: self.client.clone(),
+            project: super::state::ProjectState {
+                recorded_inputs: self.project.recorded_inputs.clone(),
+                recorded_binary_inputs: self.project.recorded_binary_inputs.clone(),
+                recorded_bindings: self.project.recorded_bindings.clone(),
+                bibliography_inputs: self.project.bibliography_inputs.clone(),
+                bibliography_databases: self.project.bibliography_databases.clone(),
+                bibliography_bindings: self.project.bibliography_bindings.clone(),
+                ..Default::default()
+            },
+            distribution: self.distribution.clone(),
+            index_truncated: self.index_truncated.clone(),
+            documents: self.documents.clone(),
+            roots: self.roots.clone(),
+            diagnostic_delivery: self.diagnostic_delivery.clone(),
+            config: self.config.clone(),
+            pending_dependencies: self.pending_dependencies.clone(),
+        }
+    }
+
     pub(crate) fn defer_dependencies(&mut self, uri: Url) {
         self.pending_dependencies.insert(uri);
     }

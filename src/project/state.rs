@@ -45,6 +45,15 @@ pub struct ProjectState {
 }
 
 impl ProjectState {
+    pub(crate) fn same_completion_inputs(&self, other: &Self, root: &Url) -> bool {
+        self.recorded_inputs.get(root) == other.recorded_inputs.get(root)
+            && self.recorded_binary_inputs.get(root) == other.recorded_binary_inputs.get(root)
+            && self.recorded_bindings.get(root) == other.recorded_bindings.get(root)
+            && self.bibliography_inputs.get(root) == other.bibliography_inputs.get(root)
+            && self.bibliography_databases.get(root) == other.bibliography_databases.get(root)
+            && self.bibliography_bindings.get(root) == other.bibliography_bindings.get(root)
+    }
+
     /// Only this root's build observations belong to a completed build. Other
     /// roots and independent lint reports may have changed during analysis.
     pub(crate) fn merge_build(&mut self, root: &Url, update: &mut Self) {

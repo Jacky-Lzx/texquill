@@ -594,6 +594,10 @@ pub(super) struct Publication {
 }
 
 impl Publication {
+    pub fn invalidates_completion(&self, current: &Workspace, root: &Url) -> bool {
+        !self.documents.is_empty() || !self.project.same_completion_inputs(&current.project, root)
+    }
+
     /// No filesystem reads or parsing here. A late edit invalidates diagnostics,
     /// while PDF/input history still records the artifact actually produced.
     pub fn merge_into(&mut self, current: &mut Workspace, root: &Url) -> bool {
@@ -669,6 +673,19 @@ mod tests {
             [(root.clone(), vec![Diagnostic::default()])].into(),
         );
         (workspace, root)
+    }
+
+    #[test]
+    fn diagnostics_and_pdf_history_do_not_invalidate_completion_inputs() {
+        let (before, root) = workspace();
+        let mut prepared = before.clone();
+        prepared.project.build_diagnostics.remove(&root);
+        prepared
+            .project
+            .pdf_checks
+            .insert(root.clone(), Arc::default());
+        let publication = captured(&before, prepared, &root);
+        assert!(!publication.invalidates_completion(&before, &root));
     }
 
     #[test]

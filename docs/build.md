@@ -34,6 +34,12 @@ and still-current document revisions. An edit arriving during this preparation
 discards outdated diagnostics while preserving the produced PDF's input history
 and other roots' build state.
 
+Prepared command/path completion reads a separately published immutable input
+snapshot. Cache hits do not acquire the compilation workspace lock. Each edit
+publishes its current text before the next ordered request; macro/context changes
+still invalidate incompatible candidates. PDF history and diagnostic-only build
+updates retain prepared candidates when source and dependency inputs agree.
+
 Compilation can be triggered in Neovim like this:
 
 ```lua

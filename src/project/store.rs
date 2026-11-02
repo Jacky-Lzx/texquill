@@ -14,6 +14,8 @@ pub struct WorkspaceUpdate<'a> {
     changed: bool,
     completion_epoch: Option<&'a AtomicU64>,
     source_revision: Option<&'a AtomicU64>,
+    completion_inputs: &'a std::sync::RwLock<Arc<CompletionInputs>>,
+    epoch: &'a AtomicU64,
 }
 
 impl Deref for WorkspaceUpdate<'_> {
@@ -40,6 +42,37 @@ impl DerefMut for WorkspaceUpdate<'_> {
     }
 }
 
+#[derive(Default)]
+pub(crate) struct CompletionInputs {
+    pub workspace: Workspace,
+    pub epoch: u64,
+}
+
+impl CompletionInputs {
+    fn capture(workspace: &Workspace, epoch: u64) -> Arc<Self> {
+        Arc::new(Self {
+            workspace: workspace.completion_snapshot(),
+            epoch,
+        })
+    }
+
+    fn publish(slot: &std::sync::RwLock<Arc<Self>>, next: Arc<Self>) {
+        let old = std::mem::replace(&mut *slot.write().unwrap(), next);
+        // Destruction of an obsolete syntax tree must not hold the reader slot.
+        drop(old);
+    }
+}
+
+impl Drop for WorkspaceUpdate<'_> {
+    fn drop(&mut self) {
+        if self.changed {
+            let next =
+                CompletionInputs::capture(&self.workspace, self.epoch.load(Ordering::SeqCst));
+            CompletionInputs::publish(self.completion_inputs, next);
+        }
+    }
+}
+
 #[derive(Clone, Default)]
 pub struct WorkspaceStore {
     workspace: Arc<RwLock<Workspace>>,
@@ -48,6 +81,7 @@ pub struct WorkspaceStore {
     queued_changes: Arc<AtomicUsize>,
     completion_epoch: Arc<AtomicU64>,
     source_revision: Arc<AtomicU64>,
+    completion_inputs: Arc<std::sync::RwLock<Arc<CompletionInputs>>>,
 }
 
 /// Count notifications from receipt until their ordered handler completes,
@@ -62,7 +96,11 @@ impl Drop for QueuedChange {
 
 impl WorkspaceStore {
     pub fn new(workspace: Workspace) -> Self {
+        let completion_inputs = Arc::new(std::sync::RwLock::new(CompletionInputs::capture(
+            &workspace, 0,
+        )));
         Self {
+            completion_inputs,
             workspace: Arc::new(RwLock::new(workspace)),
             revision: Arc::default(),
             updated: Arc::default(),
@@ -79,7 +117,9 @@ impl WorkspaceStore {
                 return workspace;
             }
             drop(workspace);
-            if self.workspace.write().await.refresh_pending_dependencies() {
+            let mut workspace = self.workspace.write().await;
+            if workspace.refresh_pending_dependencies() {
+                self.publish_completion(&workspace);
                 self.updated.notify_waiters();
             }
         }
@@ -92,7 +132,9 @@ impl WorkspaceStore {
                 return workspace;
             }
             drop(workspace);
-            if self.workspace.write().await.refresh_pending_dependencies() {
+            let mut workspace = self.workspace.write().await;
+            if workspace.refresh_pending_dependencies() {
+                self.publish_completion(&workspace);
                 self.updated.notify_waiters();
             }
         }
@@ -103,6 +145,7 @@ impl WorkspaceStore {
     pub async fn write(&self) -> WorkspaceUpdate<'_> {
         let mut workspace = self.workspace.write().await;
         if workspace.refresh_pending_dependencies() {
+            self.publish_completion(&workspace);
             self.updated.notify_waiters();
         }
         self.update(workspace, true, true)
@@ -133,6 +176,8 @@ impl WorkspaceStore {
             changed: false,
             completion_epoch: invalidate.then_some(&self.completion_epoch),
             source_revision: source.then_some(&self.source_revision),
+            completion_inputs: &self.completion_inputs,
+            epoch: &self.completion_epoch,
         }
     }
 
@@ -140,6 +185,17 @@ impl WorkspaceStore {
     /// language queries must use a fresh guard or a certified prepared result.
     pub(crate) async fn read_unindexed(&self) -> RwLockReadGuard<'_, Workspace> {
         self.workspace.read().await
+    }
+
+    fn publish_completion(&self, workspace: &Workspace) {
+        let next = CompletionInputs::capture(workspace, self.completion_epoch());
+        CompletionInputs::publish(&self.completion_inputs, next);
+    }
+
+    /// A coherent published input revision, independent of the async workspace
+    /// lock. Ordered edits publish before yielding their dispatch turn.
+    pub(crate) fn completion_inputs(&self) -> Arc<CompletionInputs> {
+        self.completion_inputs.read().unwrap().clone()
     }
 
     pub(crate) fn invalidate_completion(&self) {

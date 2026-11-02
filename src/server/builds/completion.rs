@@ -156,9 +156,12 @@ impl BuildManager {
             let (inlay_refresh, delivery, reschedule_push) = {
                 // All disk reads, reloads, diagnostics and artifact fingerprints
                 // are complete. Merge only this root and unchanged documents.
-                let mut current = workspace.write_changes().await;
+                let mut current = workspace.write_prepared().await;
+                let invalidate = prepared.invalidates_completion(&current, &root_uri);
                 let reschedule = prepared.merge_into(&mut current, &root_uri);
-                workspace.invalidate_completion();
+                if invalidate {
+                    workspace.invalidate_completion();
+                }
                 (
                     current.client.inlay_refresh,
                     current.diagnostic_delivery.clone(),

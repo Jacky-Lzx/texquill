@@ -1557,10 +1557,11 @@ impl Backend {
     ) -> Result<Option<CompletionResponse>> {
         let (prepare_path, epoch) = {
             let position = &params.text_document_position;
-            let workspace = self.workspace.read_unindexed().await;
+            let inputs = self.workspace.completion_inputs();
+            let workspace = &inputs.workspace;
             if let Some(items) = self.completion.complete(
-                &workspace,
-                self.workspace.completion_epoch(),
+                workspace,
+                inputs.epoch,
                 &document_uri(position.text_document.uri.clone()),
                 position.position,
             ) {
@@ -1580,7 +1581,7 @@ impl Backend {
                 .documents
                 .get(&document_uri(position.text_document.uri.clone()))
                 .is_some_and(|doc| crate::language::path_cache::candidate(doc, position.position));
-            (prepare, self.workspace.completion_epoch())
+            (prepare, inputs.epoch)
         };
         self.completion.schedule(
             self.workspace.clone(),
@@ -1987,6 +1988,112 @@ mod read_query_tests {
     use super::*;
     use std::time::Duration;
     use tokio::sync::oneshot;
+
+    async fn warm_completion(backend: &Backend, uri: &Url, source: &str) -> Position {
+        {
+            let mut inputs = backend.workspace.write().await;
+            inputs.client.snippets = true;
+            inputs.documents.insert(
+                uri.clone(),
+                workspace::Document::new(uri, source.into(), Some(1)),
+            );
+        }
+        backend.completion.schedule(
+            backend.workspace.clone(),
+            backend.queries.clone(),
+            backend.client.clone(),
+            backend.pending_change_publish.clone(),
+            true,
+            Some(uri.clone()),
+        );
+        let position =
+            crate::text::Text::new(source.into()).position(source.find("\\inp").unwrap() + 4);
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let inputs = backend.workspace.completion_inputs();
+                if backend
+                    .completion
+                    .complete(&inputs.workspace, inputs.epoch, uri, position)
+                    .is_some()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        position
+    }
+
+    #[tokio::test]
+    async fn prepared_completion_does_not_acquire_the_build_workspace_lock() {
+        let (client, _outgoing) = Client::new();
+        let backend = Backend::new(client);
+        let uri = Url::parse("untitled:build-lock.tex").unwrap();
+        let source = "\\documentclass{article}\n\\begin{document}\n\\inp\n\\end{document}\n";
+        let position = warm_completion(&backend, &uri, source).await;
+        let epoch = backend.workspace.completion_epoch();
+        let mut build = backend.workspace.write_prepared().await;
+        build
+            .project
+            .build_diagnostics
+            .insert(uri.clone(), Default::default());
+        let response = tokio::time::timeout(
+            Duration::from_secs(1),
+            backend.completion(
+                serde_json::from_value(
+                    serde_json::json!({"textDocument":{"uri":uri},"position":position}),
+                )
+                .unwrap(),
+            ),
+        )
+        .await
+        .expect("cached completion waited for a build writer")
+        .unwrap()
+        .unwrap();
+        let items = match response {
+            CompletionResponse::Array(items) => items,
+            CompletionResponse::List(list) => list.items,
+        };
+        let item = items.iter().find(|item| item.label == "input").unwrap();
+        let Some(CompletionTextEdit::Edit(edit)) = &item.text_edit else {
+            panic!("missing edit");
+        };
+        assert_eq!(edit.range.end, position);
+        assert_eq!(edit.new_text, "input{${1:file}}");
+        drop(build);
+        assert_eq!(backend.workspace.completion_inputs().epoch, epoch);
+        backend.completion.close();
+    }
+
+    #[tokio::test]
+    async fn published_completion_inputs_reject_a_changed_macro_before_repreparation() {
+        let (client, _outgoing) = Client::new();
+        let backend = Backend::new(client);
+        let uri = Url::parse("untitled:published-macro.tex").unwrap();
+        let source =
+            "\\newcommand{\\projectmacro}[2]{#1#2}\n\\begin{document}\n\\inp\n\\end{document}\n";
+        let position = warm_completion(&backend, &uri, source).await;
+        let old = backend.workspace.completion_inputs();
+        {
+            let mut inputs = backend.workspace.write_changes().await;
+            let edited = inputs.documents[&uri].with_text(
+                &uri,
+                source.replace("[2]{#1#2}", "[1]{#1}"),
+                Some(2),
+            );
+            inputs.documents.insert(uri.clone(), edited);
+        }
+        let current = backend.workspace.completion_inputs();
+        assert_eq!(old.workspace.documents[&uri].version, Some(1));
+        assert_eq!(current.workspace.documents[&uri].version, Some(2));
+        assert!(backend
+            .completion
+            .complete(&current.workspace, current.epoch, &uri, position)
+            .is_none());
+        backend.completion.close();
+    }
 
     #[tokio::test]
     async fn prepared_completion_overtakes_waiting_views_without_serving_old_source_positions() {
