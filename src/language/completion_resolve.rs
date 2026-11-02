@@ -1,6 +1,6 @@
 //! Resolve only documentation, retaining the completion's original edits.
 use crate::rpc::{Error, ErrorCode, Result};
-use crate::{parser::syntax, project::workspace::Workspace, symbols::command_docs};
+use crate::{project::workspace::Workspace, symbols::command_docs};
 use lsp_types::*;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -49,8 +49,8 @@ impl<'a> Commands<'a> {
         }
     }
 
-    pub(crate) fn apply(&self, item: &mut CompletionItem, entry: &syntax::Entry) {
-        self.apply_name(item, &entry.name, command_docs::Namespace::Command);
+    pub(crate) fn apply_command(&self, item: &mut CompletionItem, name: &str) {
+        self.apply_name(item, name, command_docs::Namespace::Command);
     }
 
     pub(crate) fn apply_environment(&self, item: &mut CompletionItem, name: &str) {

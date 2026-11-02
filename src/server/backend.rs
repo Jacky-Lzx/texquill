@@ -996,12 +996,13 @@ impl Backend {
         };
         let updated = doc.with_text(&uri, text.source, Some(params.text_document.version));
         let prepare_path = crate::language::path_cache::changed_candidate(doc, &updated);
+        let prepare_commands = crate::language::command_index::changed_declarations(doc, &updated);
         workspace.documents.insert(uri.clone(), updated);
         workspace.clear_build_diagnostics(&uri);
         workspace.defer_dependencies(uri.clone());
         self.pending_change_publish.store(true, Ordering::SeqCst);
         drop(workspace);
-        if prepare_path {
+        if prepare_path || prepare_commands {
             self.completion.schedule(
                 self.workspace.clone(),
                 self.queries.clone(),

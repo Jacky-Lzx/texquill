@@ -4563,7 +4563,28 @@ pub(crate) fn lookup<'a>(
     scope: &BTreeSet<Url>,
     aliases: Option<&OnceCell<CommandSignatures<'a>>>,
 ) -> Option<Signature> {
-    let mut definitions = workspace
+    lookup_indexed(workspace, name, environment, scope, aliases, None)
+}
+
+type SourceDeclaration<'a> = (&'a Url, &'a Document, &'a Entry);
+fn find_declaration<'a>(
+    workspace: &'a Workspace,
+    name: &str,
+    environment: bool,
+    scope: &BTreeSet<Url>,
+    index: Option<&crate::symbols::command_docs::Index<'a>>,
+) -> Result<Option<SourceDeclaration<'a>>, ()> {
+    if let Some(index) = index {
+        let namespace = if environment {
+            crate::symbols::command_docs::Namespace::Environment
+        } else {
+            crate::symbols::command_docs::Namespace::Command
+        };
+        return index
+            .declaration(name, namespace)
+            .map(|declaration| declaration.map(|d| (d.uri, d.doc, d.entry)));
+    }
+    let mut declarations = workspace
         .documents
         .iter()
         .filter(|(uri, _)| scope.contains(*uri))
@@ -4577,10 +4598,24 @@ pub(crate) fn lookup<'a>(
             .filter(move |entry| entry.name == name)
             .map(move |entry| (uri, doc, entry))
         });
-    if let Some((uri, doc, entry)) = definitions.next() {
-        if definitions.next().is_some() {
-            return None;
-        }
+    let first = declarations.next();
+    if declarations.next().is_some() {
+        Err(())
+    } else {
+        Ok(first)
+    }
+}
+
+pub(crate) fn lookup_indexed<'a>(
+    workspace: &'a Workspace,
+    name: &str,
+    environment: bool,
+    scope: &BTreeSet<Url>,
+    aliases: Option<&OnceCell<CommandSignatures<'a>>>,
+    index: Option<&crate::symbols::command_docs::Index<'a>>,
+) -> Option<Signature> {
+    let declaration = find_declaration(workspace, name, environment, scope, index).ok()?;
+    if let Some((uri, doc, entry)) = declaration {
         let mut signature = source_definition(&doc.text.source, &doc.syntax, entry, environment)?;
         if !environment
             && signature.parameters.is_empty()
@@ -4603,21 +4638,9 @@ pub(crate) fn lookup<'a>(
     } else if environment {
         builtin_environment(name)
     } else {
-        let mut environments = workspace
-            .documents
-            .iter()
-            .filter(|(uri, _)| scope.contains(*uri))
-            .flat_map(|(uri, doc)| {
-                doc.syntax
-                    .environments
-                    .iter()
-                    .filter(move |entry| entry.name == name)
-                    .map(move |entry| (uri, doc, entry))
-            });
-        if let Some((uri, doc, entry)) = environments.next() {
-            if environments.next().is_some() {
-                return None;
-            }
+        if let Some((uri, doc, entry)) =
+            find_declaration(workspace, name, true, scope, index).ok()?
+        {
             let mut signature = definition(uri, doc, entry, true)?;
             signature.name = name.into();
             signature.parameters.remove(0);

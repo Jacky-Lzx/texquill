@@ -41,21 +41,31 @@ pub(crate) fn loaded(workspace: &Workspace, scope: &BTreeSet<Url>) -> BTreeSet<S
         if !scope.contains(uri) {
             continue;
         }
-        for command in &doc.syntax.commands {
-            if doc.syntax.control_operands.contains(&command.span.start)
-                || syntax::loader_extension(&command.name) != Some("sty")
-            {
-                continue;
-            }
-            if let Some(arg) = syntax::file_argument(&doc.text.source, command) {
-                for name in arg.value.split(',').map(syntax::loader_name) {
-                    if syntax::is_static_key(&name) {
-                        result.insert(name);
-                    }
+        result.extend(direct(doc));
+    }
+    expand(result)
+}
+
+pub(crate) fn direct(doc: &crate::project::workspace::Document) -> BTreeSet<String> {
+    let mut result = BTreeSet::new();
+    for command in &doc.syntax.commands {
+        if doc.syntax.control_operands.contains(&command.span.start)
+            || syntax::loader_extension(&command.name) != Some("sty")
+        {
+            continue;
+        }
+        if let Some(arg) = syntax::file_argument(&doc.text.source, command) {
+            for name in arg.value.split(',').map(syntax::loader_name) {
+                if syntax::is_static_key(&name) {
+                    result.insert(name);
                 }
             }
         }
     }
+    result
+}
+
+pub(crate) fn expand(mut result: BTreeSet<String>) -> BTreeSet<String> {
     loop {
         let before = result.len();
         for package in catalog() {

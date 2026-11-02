@@ -35,7 +35,7 @@ pub(crate) enum Namespace {
 
 pub(crate) struct Declaration<'a> {
     pub(crate) uri: &'a Url,
-    doc: &'a Document,
+    pub(crate) doc: &'a Document,
     pub(crate) entry: &'a syntax::Entry,
 }
 
@@ -46,6 +46,21 @@ pub(crate) struct Index<'a> {
 }
 
 impl<'a> Index<'a> {
+    pub(crate) fn declaration(
+        &self,
+        name: &str,
+        namespace: Namespace,
+    ) -> Result<Option<&Declaration<'a>>, ()> {
+        let index = match namespace {
+            Namespace::Command => &self.definitions,
+            Namespace::Environment => &self.environments,
+        };
+        match index.get(name) {
+            None => Ok(None),
+            Some(Some(declaration)) => Ok(Some(declaration)),
+            Some(None) => Err(()),
+        }
+    }
     pub(crate) fn new(ws: &'a Workspace, scope: &BTreeSet<Url>) -> Self {
         let mut definitions = BTreeMap::new();
         let mut environments = BTreeMap::new();

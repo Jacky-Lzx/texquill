@@ -52,6 +52,7 @@ pub(crate) struct CompletionSignatures<'a> {
     workspace: &'a Workspace,
     scope: &'a BTreeSet<Url>,
     aliases: OnceCell<CommandSignatures<'a>>,
+    definitions: OnceCell<crate::symbols::command_docs::Index<'a>>,
 }
 
 impl<'a> CompletionSignatures<'a> {
@@ -60,15 +61,25 @@ impl<'a> CompletionSignatures<'a> {
             workspace,
             scope,
             aliases: OnceCell::new(),
+            definitions: OnceCell::new(),
         }
     }
 
     pub(super) fn resolved(&self, name: &str) -> Option<Signature> {
-        lookup(self.workspace, name, false, self.scope, Some(&self.aliases))
+        crate::symbols::commands::lookup_indexed(
+            self.workspace,
+            name,
+            false,
+            self.scope,
+            Some(&self.aliases),
+            Some(self.definitions.get_or_init(|| {
+                crate::symbols::command_docs::Index::new(self.workspace, self.scope)
+            })),
+        )
     }
 
     pub(crate) fn at(&self, name: &str, following: &str) -> Option<(String, Option<String>)> {
-        let signature = lookup(self.workspace, name, false, self.scope, Some(&self.aliases))?;
+        let signature = self.resolved(name)?;
         if existing_arguments(&signature, following) {
             return Some((signature.label(), None));
         }
@@ -111,6 +122,21 @@ impl<'a> CompletionSignatures<'a> {
             }
         }
         Some((signature.label(), (tabstop > 0).then_some(snippet)))
+    }
+
+    pub(crate) fn has_existing_arguments(&self, name: &str, following: &str) -> bool {
+        // A short builtin-only result need not allocate a project-wide lookup
+        // table. Reuse it when user/package candidates have already needed it.
+        if self.definitions.get().is_none()
+            || name == "lstinline"
+            || name == "Verb"
+            || crate::parser::fancyvrb::is_inline_save(name)
+            || crate::parser::fancyvrb::is_use(name)
+        {
+            return has_existing_arguments(self.workspace, name, self.scope, following);
+        }
+        self.resolved(name)
+            .is_some_and(|signature| existing_arguments(&signature, following))
     }
 }
 

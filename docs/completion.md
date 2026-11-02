@@ -4,6 +4,14 @@
 
 Supports common LaTeX commands, environments, in-project user commands, cross-file labels, BibTeX entry types, field names, string abbreviations and citation keys, as well as paths to input files, images and local packages. Supports mid-word substitution; when optional parameters of references and paths contain nested commands, the current key name or file parameter can still be found.
 
+Command names have a separate per-file index. Editing one file updates its
+contribution while unchanged files retain theirs. Parameter and comment edits
+can reuse the same names; completion still reads the current signatures and
+documentation. Built-in and package catalogs have shared prefix indexes.
+Background work prepares these contributions, and a request can index a changed
+file directly without waiting for a complete candidate-list rebuild. Contextual
+analysis still determines visibility, math mode and argument handling.
+
 Ordinary command candidates are prepared in the background when a LaTeX buffer
 opens. Eligible prose, comment and command-prefix edits reuse those templates;
 replacement ranges and snippet decisions still use the current text. Macro,

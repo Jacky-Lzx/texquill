@@ -74,7 +74,7 @@ struct State {
     prefixes: VecDeque<Prefix>,
 }
 #[derive(Default)]
-pub(crate) struct Cache(Mutex<State>);
+pub(crate) struct Cache(Mutex<State>, crate::language::command_index::Cache);
 
 pub(crate) struct Binding {
     pub cache: Arc<Cache>,
@@ -204,6 +204,9 @@ impl Binding {
     }
 }
 impl Cache {
+    pub fn command_candidates(&self) -> &crate::language::command_index::Cache {
+        &self.1
+    }
     pub fn prefix(&self, inputs: &PrefixInputs) -> Option<Arc<CommandSignatures<'static>>> {
         let mut state = self.0.lock().unwrap();
         let at = state

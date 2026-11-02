@@ -130,6 +130,7 @@ impl Completion {
             let work = move |cancel: &crate::analysis::AnalysisContext| {
                 crate::analysis::AnalysisContext::new().run(|context| {
                     let mut snapshot = snapshot;
+                    analysis.command_candidates().prepare(&snapshot);
                     let updates = crate::analysis::AnalysisContext::for_workspace(
                         &snapshot,
                         epoch,
