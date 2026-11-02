@@ -913,77 +913,85 @@ pub(crate) fn refresh(workspace: &mut Workspace) {
     }
     // A custom call can expose another input previously hidden as data.
     for round in 0..16 {
-        let sources: BTreeMap<_, _> = workspace
-            .documents
-            .iter()
-            .filter(|(_, doc)| doc.kind == DocumentKind::Latex)
-            .map(|(uri, doc)| {
-                (
-                    uri.clone(),
-                    Cache::source(
-                        doc,
-                        SourceInputs {
-                            readers: doc.syntax.contextual_resource_readers.clone(),
-                            ..Default::default()
-                        },
-                    ),
-                )
-            })
-            .collect();
-        let mut analysis = Analysis {
-            names: names.clone(),
-            ..Default::default()
-        };
-        let roots: Vec<_> = sources
-            .keys()
-            .filter(|uri| workspace.is_saved_root(uri))
-            .cloned()
-            .collect();
-        for root in &roots {
-            analysis.walk(
-                workspace,
-                root,
-                root,
-                &mut Context::default(),
-                &mut BTreeSet::new(),
-            );
-        }
-        // Prefer graph entries so a child does not add a false empty context.
-        let children: BTreeSet<_> = sources
-            .iter()
-            .flat_map(|(uri, source)| {
-                source
-                    .syntax
-                    .commands
-                    .iter()
-                    .filter(|command| source.active.contains(&command.span.start))
-                    .flat_map(|command| workspace.literal_command_dependencies(uri, uri, command))
-                    .map(|(uri, _)| uri)
-                    .collect::<Vec<_>>()
-            })
-            .collect();
-        for uri in sources.keys().filter(|uri| !children.contains(*uri)) {
-            if !analysis.visited.contains(uri) && !analysis.excluded.contains(uri) {
+        // Each round observes an immutable workspace. Share graph/signature
+        // analyses during that round, then discard them before loading missing
+        // files or applying its grammar to the workspace.
+        let (sources, mut analysis) = crate::analysis::AnalysisContext::new().run(|_| {
+            let sources: BTreeMap<_, _> = workspace
+                .documents
+                .iter()
+                .filter(|(_, doc)| doc.kind == DocumentKind::Latex)
+                .map(|(uri, doc)| {
+                    (
+                        uri.clone(),
+                        Cache::source(
+                            doc,
+                            SourceInputs {
+                                readers: doc.syntax.contextual_resource_readers.clone(),
+                                ..Default::default()
+                            },
+                        ),
+                    )
+                })
+                .collect();
+            let mut analysis = Analysis {
+                names: names.clone(),
+                ..Default::default()
+            };
+            let roots: Vec<_> = sources
+                .keys()
+                .filter(|uri| workspace.is_saved_root(uri))
+                .cloned()
+                .collect();
+            for root in &roots {
                 analysis.walk(
                     workspace,
-                    uri,
-                    uri,
+                    root,
+                    root,
                     &mut Context::default(),
                     &mut BTreeSet::new(),
                 );
             }
-        }
-        for uri in sources.keys() {
-            if !analysis.visited.contains(uri) && !analysis.excluded.contains(uri) {
-                analysis.walk(
-                    workspace,
-                    uri,
-                    uri,
-                    &mut Context::default(),
-                    &mut BTreeSet::new(),
-                );
+            // Prefer graph entries so a child does not add a false empty context.
+            let children: BTreeSet<_> = sources
+                .iter()
+                .flat_map(|(uri, source)| {
+                    source
+                        .syntax
+                        .commands
+                        .iter()
+                        .filter(|command| source.active.contains(&command.span.start))
+                        .flat_map(|command| {
+                            workspace.literal_command_dependencies(uri, uri, command)
+                        })
+                        .map(|(uri, _)| uri)
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+            for uri in sources.keys().filter(|uri| !children.contains(*uri)) {
+                if !analysis.visited.contains(uri) && !analysis.excluded.contains(uri) {
+                    analysis.walk(
+                        workspace,
+                        uri,
+                        uri,
+                        &mut Context::default(),
+                        &mut BTreeSet::new(),
+                    );
+                }
             }
-        }
+            for uri in sources.keys() {
+                if !analysis.visited.contains(uri) && !analysis.excluded.contains(uri) {
+                    analysis.walk(
+                        workspace,
+                        uri,
+                        uri,
+                        &mut Context::default(),
+                        &mut BTreeSet::new(),
+                    );
+                }
+            }
+            (sources, analysis)
+        });
         if analysis.names != names {
             if round < 15 {
                 names = analysis.names.clone();

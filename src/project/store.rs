@@ -5,11 +5,12 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
     Arc,
 };
-use tokio::sync::{OwnedRwLockReadGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use tokio::sync::{Notify, OwnedRwLockReadGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 pub struct WorkspaceUpdate<'a> {
     workspace: RwLockWriteGuard<'a, Workspace>,
     revision: &'a AtomicU64,
+    updated: &'a Notify,
     changed: bool,
 }
 
@@ -25,6 +26,7 @@ impl DerefMut for WorkspaceUpdate<'_> {
         if !self.changed {
             self.revision.fetch_add(1, Ordering::SeqCst);
             self.changed = true;
+            self.updated.notify_waiters();
         }
         &mut self.workspace
     }
@@ -34,6 +36,7 @@ impl DerefMut for WorkspaceUpdate<'_> {
 pub struct WorkspaceStore {
     workspace: Arc<RwLock<Workspace>>,
     revision: Arc<AtomicU64>,
+    updated: Arc<Notify>,
 }
 
 impl WorkspaceStore {
@@ -41,6 +44,7 @@ impl WorkspaceStore {
         Self {
             workspace: Arc::new(RwLock::new(workspace)),
             revision: Arc::default(),
+            updated: Arc::default(),
         }
     }
 
@@ -59,6 +63,7 @@ impl WorkspaceStore {
         WorkspaceUpdate {
             workspace,
             revision: &self.revision,
+            updated: &self.updated,
             changed: false,
         }
     }
@@ -66,11 +71,49 @@ impl WorkspaceStore {
     pub fn revision(&self) -> u64 {
         self.revision.load(Ordering::SeqCst)
     }
+
+    pub(crate) async fn changed_since(&self, revision: u64) {
+        loop {
+            // Register before checking the revision so an update cannot land
+            // between the check and sleeping, including before the first poll.
+            let updated = self.updated.notified();
+            if self.revision() != revision {
+                return;
+            }
+            updated.await;
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn revision_waiters_wake_on_mutation_and_detect_changes_before_their_first_poll() {
+        let store = WorkspaceStore::default();
+        let revision = store.revision();
+        let mut changed = Box::pin(store.changed_since(revision));
+        std::future::poll_fn(|context| {
+            assert!(std::future::Future::poll(changed.as_mut(), context).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        assert!(!store.write().await.client.snippets);
+        std::future::poll_fn(|context| {
+            assert!(std::future::Future::poll(changed.as_mut(), context).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        let unpolled = store.changed_since(revision);
+        store.write().await.client.snippets = true;
+        tokio::time::timeout(std::time::Duration::from_secs(1), changed)
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), unpolled)
+            .await
+            .unwrap();
+    }
 
     #[tokio::test]
     async fn writes_invalidate_snapshots_even_when_replacing_the_workspace() {

@@ -29,6 +29,27 @@ disables distribution discovery, save-triggered builds and ChkTeX to isolate
 source analysis. JSON includes all samples, medians and binary hashes. This is a
 server protocol measurement, not an editor UI latency measurement.
 
+`benchmarks/completion_load.py` adds the concurrent load of an editing session:
+it types `\`, `\i`, `\in`, `\inp` at 350 ms intervals, cancels superseded
+completions, and sends automatic linked editing, tokens, inlay hints, colors,
+highlights, symbols, diagnostics and code actions after each edit. Diagnostic
+refreshes trigger both workspace and attached-document pulls. The main source
+and one BibTeX buffer are open, with snippet completion enabled.
+
+```sh
+python3 benchmarks/completion_load.py /path/to/project \
+  --before target/benchmarks/before --after target/release/texquill \
+  --output target/benchmarks/completion-load.json
+```
+
+The script alternates startup order over three paired runs, measures the final
+keystroke-to-completion response, and checks the complete completion edits and
+all final background view responses against the baseline. Superseded views may
+be cancelled, but current views must finish successfully. It copies the project
+and disables builds and distribution discovery, as above. JSON includes binary
+hashes and request timings/errors. Editor menu timing needs a separate real
+Neovim check; this protocol workload does not measure rendering.
+
 ## Generated editing sessions
 
 By default, three sizes of deterministically generated projects are measured: small is 1 chapter and 16 sections per chapter; medium is 4 chapters and 32 sections per chapter; large is 8 chapters and 64 sections per chapter. Each project contains the main document, chapter files and BibTeX database. The text contains Chinese, emoji, mathematical environment, user macros, cross-file labels and citations. Projects are all below the default index budget; the test rejects index truncation.

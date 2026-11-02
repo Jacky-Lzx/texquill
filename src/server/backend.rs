@@ -49,6 +49,22 @@ fn validate_diagnostic_identifier(identifier: Option<&str>) -> Result<()> {
     }
 }
 
+fn content_modified() -> crate::rpc::Error {
+    crate::rpc::Error {
+        code: crate::rpc::ErrorCode::ServerError(-32801),
+        message: "Analysis inputs changed".into(),
+        data: None,
+    }
+}
+
+fn diagnostic_modified() -> crate::rpc::Error {
+    crate::rpc::Error {
+        code: crate::rpc::ErrorCode::ServerError(-32802),
+        message: "Diagnostic inputs changed".into(),
+        data: Some(serde_json::json!({"retriggerRequest":false})),
+    }
+}
+
 pub struct Backend {
     client: Client,
     workspace: WorkspaceStore,
@@ -121,7 +137,44 @@ impl Backend {
     ) -> Result<T> {
         let workspace = self.workspace.read().await.clone();
         dispatch::release();
-        self.queries.run(move |_| Ok(query(&workspace))).await
+        self.queries
+            .run(move |_| Ok(crate::analysis::AnalysisContext::new().run(|_| query(&workspace))))
+            .await
+    }
+
+    /// Automatically refreshed views have no use after their input revision
+    /// changes. Drop obsolete queued work and propagate cancellation to nested
+    /// readers; interactive requests retain their ordered snapshot semantics.
+    async fn read_background_query<T: Send + 'static>(
+        &self,
+        query: impl FnOnce(&Workspace) -> T + Send + 'static,
+    ) -> Result<T> {
+        let (workspace, revision) = {
+            let workspace = self.workspace.read().await;
+            (workspace.clone(), self.workspace.revision())
+        };
+        let revisions = self.workspace.clone();
+        dispatch::release();
+        let work = self.queries.run_background(move |_| {
+            let context_revisions = revisions.clone();
+            let context = crate::analysis::AnalysisContext::cancellable(move || {
+                context_revisions.revision() != revision
+            });
+            if revisions.revision() != revision {
+                return Err(content_modified());
+            }
+            let result =
+                context.run(|_| crate::analysis::AnalysisContext::new().run(|_| query(&workspace)));
+            if revisions.revision() != revision {
+                return Err(content_modified());
+            }
+            Ok(result)
+        });
+        tokio::select! {
+            biased;
+            _ = self.workspace.changed_since(revision) => Err(content_modified()),
+            result = work => result,
+        }
     }
 
     async fn read_edit_query<T: Send + 'static>(
@@ -136,7 +189,12 @@ impl Backend {
         dispatch::release();
         for attempt in 0..2 {
             let operation = query.clone();
-            let result = self.queries.run(move |_| operation(&workspace)).await?;
+            let result = self
+                .queries
+                .run(move |_| {
+                    crate::analysis::AnalysisContext::new().run(|_| operation(&workspace))
+                })
+                .await?;
             let current = self.workspace.read().await;
             if self.workspace.revision() == revision {
                 return Ok(result);
@@ -363,73 +421,81 @@ impl Backend {
         let revisions = self.workspace.clone();
         let refresh_supported = delivery.supports_refresh();
         dispatch::release();
-        let mut cache = self.diagnostic_cache.clone().lock_owned().await;
-        let result = self
-            .queries
-            .run(move |cancel| {
-                let inputs = revisions.clone();
-                crate::analysis::AnalysisContext::cancellable(move || {
-                    refresh_supported && inputs.revision() != revision
-                })
-                .run(|context| {
-                    let superseded = || refresh_supported && revisions.revision() != revision;
-                    let cancelled = || crate::rpc::Error {
-                        code: crate::rpc::ErrorCode::ServerError(-32802),
-                        message: "Diagnostic inputs changed".into(),
-                        data: Some(serde_json::json!({"retriggerRequest":false})),
-                    };
-                    if superseded() {
-                        return Err(cancelled());
-                    }
-                    let mut reports = std::collections::BTreeMap::new();
-                    let missing: Vec<_> = uris
-                        .into_iter()
-                        .filter(|uri| {
-                            if let Some(report) =
-                                cache.lookup(uri, previous.get(uri).map(String::as_str), revision)
-                            {
-                                reports.insert(uri.clone(), report);
-                                false
-                            } else {
-                                true
-                            }
-                        })
-                        .collect();
-                    if !missing.is_empty() {
-                        let (snapshots, files) = diagnostic_inputs::Files::capture(|| {
-                            workspace
-                                .diagnostic_snapshots_cancelled(missing, || context.cancelled())
-                        });
+        let work = async {
+            let mut cache = self.diagnostic_cache.clone().lock_owned().await;
+            self.queries
+                .run_background(move |cancel| {
+                    let inputs = revisions.clone();
+                    crate::analysis::AnalysisContext::cancellable(move || {
+                        refresh_supported && inputs.revision() != revision
+                    })
+                    .run(|context| {
+                        let superseded = || refresh_supported && revisions.revision() != revision;
                         if superseded() {
-                            return Err(cancelled());
+                            return Err(diagnostic_modified());
                         }
-                        cancel.check()?;
-                        for snapshot in snapshots {
-                            let uri = snapshot.0.clone();
-                            let report = cache.computed(
-                                snapshot,
-                                previous.get(&uri).map(String::as_str),
-                                Some(diagnostic::Inputs {
+                        let mut reports = std::collections::BTreeMap::new();
+                        let missing: Vec<_> = uris
+                            .into_iter()
+                            .filter(|uri| {
+                                if let Some(report) = cache.lookup(
+                                    uri,
+                                    previous.get(uri).map(String::as_str),
                                     revision,
-                                    files: files.clone(),
-                                }),
-                            );
-                            reports.insert(uri, report);
+                                ) {
+                                    reports.insert(uri.clone(), report);
+                                    false
+                                } else {
+                                    true
+                                }
+                            })
+                            .collect();
+                        if !missing.is_empty() {
+                            let (snapshots, files) = diagnostic_inputs::Files::capture(|| {
+                                workspace
+                                    .diagnostic_snapshots_cancelled(missing, || context.cancelled())
+                            });
+                            if superseded() {
+                                return Err(diagnostic_modified());
+                            }
+                            cancel.check()?;
+                            for snapshot in snapshots {
+                                let uri = snapshot.0.clone();
+                                let report = cache.computed(
+                                    snapshot,
+                                    previous.get(&uri).map(String::as_str),
+                                    Some(diagnostic::Inputs {
+                                        revision,
+                                        files: files.clone(),
+                                    }),
+                                );
+                                reports.insert(uri, report);
+                            }
                         }
-                    }
-                    if superseded() {
-                        return Err(cancelled());
-                    }
-                    Ok(reports
-                        .into_iter()
-                        .map(|(uri, report)| {
-                            let version = workspace.documents.get(&uri).and_then(|doc| doc.version);
-                            (uri, version, report)
-                        })
-                        .collect())
+                        if superseded() {
+                            return Err(diagnostic_modified());
+                        }
+                        Ok(reports
+                            .into_iter()
+                            .map(|(uri, report)| {
+                                let version =
+                                    workspace.documents.get(&uri).and_then(|doc| doc.version);
+                                (uri, version, report)
+                            })
+                            .collect())
+                    })
                 })
-            })
-            .await;
+                .await
+        };
+        let result = if refresh_supported {
+            tokio::select! {
+                biased;
+                _ = self.workspace.changed_since(revision) => Err(diagnostic_modified()),
+                result = work => result,
+            }
+        } else {
+            work.await
+        };
         if result
             .as_ref()
             .is_err_and(|error| i64::from(error.code) == -32802)
@@ -1334,7 +1400,7 @@ impl Backend {
                 "Invalid inlay hint range",
             ));
         }
-        self.read_query(move |workspace| {
+        self.read_background_query(move |workspace| {
             Some(auxiliary::hints(
                 workspace,
                 &document_uri(params.text_document.uri),
@@ -1466,7 +1532,7 @@ impl Backend {
         params: DocumentHighlightParams,
     ) -> Result<Option<Vec<DocumentHighlight>>> {
         let params = params.text_document_position_params;
-        self.read_query(move |workspace| {
+        self.read_background_query(move |workspace| {
             editing::highlights(
                 workspace,
                 &document_uri(params.text_document.uri),
@@ -1482,7 +1548,7 @@ impl Backend {
         params: LinkedEditingRangeParams,
     ) -> Result<Option<LinkedEditingRanges>> {
         let params = params.text_document_position_params;
-        self.read_query(move |workspace| {
+        self.read_background_query(move |workspace| {
             let uri = document_uri(params.text_document.uri);
             let Some(doc) = workspace.documents.get(&uri) else {
                 return Ok(None);
@@ -1523,6 +1589,19 @@ impl Backend {
         &self,
         params: CodeActionParams,
     ) -> Result<Option<CodeActionResponse>> {
+        if params.context.trigger_kind == Some(CodeActionTriggerKind::AUTOMATIC) {
+            return self
+                .read_background_query(move |workspace| {
+                    code_action_resolve::actions(
+                        workspace,
+                        &document_uri(params.text_document.uri),
+                        params.range,
+                        &params.context,
+                    )
+                })
+                .await
+                .map(Some);
+        }
         self.read_edit_query(move |workspace| {
             Ok(code_action_resolve::actions(
                 workspace,
@@ -1541,7 +1620,7 @@ impl Backend {
     }
 
     pub(crate) async fn code_lens(&self, params: CodeLensParams) -> Result<Option<Vec<CodeLens>>> {
-        self.read_query(move |workspace| {
+        self.read_background_query(move |workspace| {
             Some(code_lens::lenses(
                 workspace,
                 &document_uri(params.text_document.uri),
@@ -1554,7 +1633,7 @@ impl Backend {
         &self,
         params: DocumentSymbolParams,
     ) -> Result<Option<DocumentSymbolResponse>> {
-        self.read_query(move |workspace| {
+        self.read_background_query(move |workspace| {
             let uri = document_uri(params.text_document.uri);
             workspace.documents.get(&uri).map(|doc| {
                 if workspace.client.hierarchical_symbols {
@@ -1581,7 +1660,7 @@ impl Backend {
         &self,
         params: FoldingRangeParams,
     ) -> Result<Option<Vec<FoldingRange>>> {
-        self.read_query(move |workspace| {
+        self.read_background_query(move |workspace| {
             workspace
                 .documents
                 .get(&document_uri(params.text_document.uri))
@@ -1599,7 +1678,7 @@ impl Backend {
         &self,
         params: DocumentColorParams,
     ) -> Result<Vec<ColorInformation>> {
-        self.read_query(move |workspace| {
+        self.read_background_query(move |workspace| {
             workspace
                 .documents
                 .get(&document_uri(params.text_document.uri))
@@ -1640,7 +1719,7 @@ impl Backend {
         let uri = document_uri(params.text_document.uri);
         let query_uri = uri.clone();
         let tokens = self
-            .read_query(move |workspace| {
+            .read_background_query(move |workspace| {
                 workspace
                     .documents
                     .get(&query_uri)
@@ -1663,7 +1742,7 @@ impl Backend {
         let uri = document_uri(params.text_document.uri);
         let query_uri = uri.clone();
         let tokens = self
-            .read_query(move |workspace| {
+            .read_background_query(move |workspace| {
                 workspace
                     .documents
                     .get(&query_uri)
@@ -1685,7 +1764,7 @@ impl Backend {
         &self,
         params: SemanticTokensRangeParams,
     ) -> Result<Option<SemanticTokensRangeResult>> {
-        self.read_query(move |workspace| {
+        self.read_background_query(move |workspace| {
             workspace
                 .documents
                 .get(&document_uri(params.text_document.uri))
@@ -1701,7 +1780,7 @@ impl Backend {
         &self,
         params: DocumentLinkParams,
     ) -> Result<Option<Vec<DocumentLink>>> {
-        self.read_query(move |workspace| {
+        self.read_background_query(move |workspace| {
             Some(navigation::document_links(
                 workspace,
                 &document_uri(params.text_document.uri),
@@ -1716,6 +1795,161 @@ mod read_query_tests {
     use super::*;
     use std::time::Duration;
     use tokio::sync::oneshot;
+
+    #[tokio::test]
+    async fn obsolete_background_queues_do_not_block_completion_or_execute_old_snapshots() {
+        let (client, _outgoing) = Client::new();
+        let backend = Arc::new(Backend::new(client));
+        let uri = Url::parse("untitled:completion-priority.tex").unwrap();
+        backend.workspace.write().await.documents.insert(
+            uri.clone(),
+            workspace::Document::new(&uri, r"\inp".into(), Some(1)),
+        );
+        let mut finishes = Vec::new();
+        let mut workers = Vec::new();
+        for _ in 0..3 {
+            let queries = backend.queries.clone();
+            let (started, start) = oneshot::channel();
+            let (finish, finished) = oneshot::channel();
+            workers.push(tokio::spawn(async move {
+                queries
+                    .run_background(move |_| {
+                        let _ = started.send(());
+                        let _ = finished.blocking_recv();
+                        Ok(())
+                    })
+                    .await
+            }));
+            start.await.unwrap();
+            finishes.push(finish);
+        }
+        let entered = Arc::new(AtomicBool::new(false));
+        let called = entered.clone();
+        let old = backend.clone();
+        let mut queue = dispatch::RequestQueue::default();
+        let background = tokio::spawn(queue.ordered(async move {
+            old.read_background_query(move |_| called.store(true, Ordering::SeqCst))
+                .await
+        }));
+        let writer = backend.clone();
+        queue
+            .ordered(async move {
+                writer.workspace.write().await.client.snippets = true;
+            })
+            .await;
+        let completion = tokio::time::timeout(
+            Duration::from_secs(1),
+            queue.ordered(async move {
+                backend
+                    .completion(
+                        serde_json::from_value(serde_json::json!({
+                            "textDocument":{"uri":uri}, "position":{"line":0,"character":4}
+                        }))
+                        .unwrap(),
+                    )
+                    .await
+            }),
+        )
+        .await;
+        let obsolete = tokio::time::timeout(Duration::from_secs(1), background).await;
+        for finish in finishes {
+            let _ = finish.send(());
+        }
+        for worker in workers {
+            worker.await.unwrap().unwrap();
+        }
+        let response = completion
+            .expect("completion waited for obsolete background work")
+            .unwrap()
+            .unwrap();
+        let items = match response {
+            CompletionResponse::Array(items) => items,
+            CompletionResponse::List(list) => list.items,
+        };
+        let item = items.iter().find(|item| item.label == "input").unwrap();
+        assert_eq!(item.insert_text_format, Some(InsertTextFormat::SNIPPET));
+        assert_eq!(
+            i64::from(
+                obsolete
+                    .expect("obsolete queued view waited for a worker")
+                    .unwrap()
+                    .unwrap_err()
+                    .code
+            ),
+            -32801
+        );
+        assert!(
+            !entered.load(Ordering::SeqCst),
+            "obsolete queued analysis executed"
+        );
+    }
+
+    #[tokio::test]
+    async fn immutable_snapshot_boundaries_share_indexes_without_retaining_them_across_edits() {
+        fn query(workspace: &Workspace) -> bool {
+            let scope = workspace.documents.keys().cloned().collect();
+            let first = crate::symbols::query_cache::project_signatures(workspace, &scope);
+            let second = crate::symbols::query_cache::project_signatures(workspace, &scope);
+            assert!(
+                Arc::ptr_eq(&first, &second),
+                "snapshot did not share its immutable analysis"
+            );
+            first.command_unchanged("input")
+        }
+        let (client, _outgoing) = Client::new();
+        let backend = Backend::new(client);
+        let uri = Url::parse("untitled:snapshot-cache.tex").unwrap();
+        backend.workspace.write().await.documents.insert(
+            uri.clone(),
+            workspace::Document::new(&uri, r"\input{child}".into(), Some(1)),
+        );
+        assert!(backend.read_query(query).await.unwrap());
+        assert!(backend.read_background_query(query).await.unwrap());
+        assert!(backend.read_edit_query(|ws| Ok(query(ws))).await.unwrap());
+        backend.workspace.write().await.documents.insert(
+            uri.clone(),
+            workspace::Document::new(&uri, r"\def\input#1{}".into(), Some(2)),
+        );
+        assert!(!backend.read_query(query).await.unwrap());
+        assert!(!backend.read_background_query(query).await.unwrap());
+        assert!(!backend.read_edit_query(|ws| Ok(query(ws))).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn running_background_views_receive_revision_cancellation_and_never_return_stale_results()
+    {
+        let (client, _outgoing) = Client::new();
+        let backend = Arc::new(Backend::new(client));
+        let (started, start) = oneshot::channel();
+        let (finish, finished) = oneshot::channel();
+        let (worker_finished, worker_done) = oneshot::channel();
+        let saw_cancellation = Arc::new(AtomicBool::new(false));
+        let observed = saw_cancellation.clone();
+        let reader = backend.clone();
+        let background = tokio::spawn(async move {
+            reader
+                .read_background_query(move |_| {
+                    crate::analysis::AnalysisContext::new().run(|context| {
+                        let _ = started.send(());
+                        let _ = finished.blocking_recv();
+                        observed.store(context.cancelled(), Ordering::SeqCst);
+                        let _ = worker_finished.send(());
+                        42
+                    })
+                })
+                .await
+        });
+        start.await.unwrap();
+        backend.workspace.write().await.client.snippets = true;
+        let _ = finish.send(());
+        assert_eq!(
+            i64::from(background.await.unwrap().unwrap_err().code),
+            -32801
+        );
+        worker_done.await.unwrap();
+        assert!(saw_cancellation.load(Ordering::SeqCst));
+        assert_eq!(backend.read_background_query(|_| 7).await.unwrap(), 7);
+    }
 
     #[tokio::test]
     async fn request_cancellation_reaches_nested_analysis_contexts() {
@@ -1973,8 +2207,12 @@ mod read_query_tests {
         )
         .await
         .unwrap();
+        let obsolete = tokio::time::timeout(Duration::from_secs(1), first).await;
         drop(cache);
-        let error = first.await.unwrap().unwrap_err();
+        let error = obsolete
+            .expect("obsolete report waited for the diagnostic cache")
+            .unwrap()
+            .unwrap_err();
         assert_eq!(i64::from(error.code), -32802);
         assert_eq!(error.data.unwrap()["retriggerRequest"], false);
         let refresh = tokio::time::timeout(Duration::from_secs(1), outgoing.recv())
