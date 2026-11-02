@@ -264,6 +264,9 @@ pub struct Workspace {
     pub roots: BTreeSet<PathBuf>,
     pub diagnostic_delivery: crate::diagnostics::diagnostic::Delivery,
     pub config: crate::config::Config,
+    /// Source edits awaiting dependency and project grammar propagation.
+    #[doc(hidden)]
+    pub pending_dependencies: BTreeSet<Url>,
 }
 
 pub(crate) struct SymbolProjects {
@@ -272,6 +275,30 @@ pub(crate) struct SymbolProjects {
 }
 
 impl Workspace {
+    pub(crate) fn defer_dependencies(&mut self, uri: Url) {
+        self.pending_dependencies.insert(uri);
+    }
+
+    pub(crate) fn has_pending_dependencies(&self) -> bool {
+        !self.pending_dependencies.is_empty()
+    }
+
+    /// Every source edit is applied in order. Only dependency discovery and
+    /// project grammar propagation can be shared by the resulting revisions.
+    pub(crate) fn refresh_pending_dependencies(&mut self) -> bool {
+        if self.pending_dependencies.is_empty() {
+            return false;
+        }
+        let pending = std::mem::take(&mut self.pending_dependencies);
+        crate::analysis::AnalysisContext::lexical().run(|_| {
+            for uri in pending {
+                self.load_dependencies_inner(&uri, &uri, 0, &mut BTreeSet::new(), false, &mut None);
+            }
+            self.refresh_context();
+        });
+        true
+    }
+
     /// Keep one extra candidate for the protocol's incomplete-list response.
     pub(crate) fn completion_budget(&self) -> usize {
         self.config.indexing.completion_limit.saturating_add(1)

@@ -76,7 +76,10 @@ def replay(binary, root, args):
         server.request("textDocument/documentSymbol", document)
         previous = None
         typing = time.perf_counter()
-        for index, prefix in enumerate(["\\", "\\i", "\\in", "\\inp"]):
+        prose = "% typing " + "x" * args.prelude_edits + "\n" if args.prelude_edits else ""
+        prefixes = ["% typing " + "x" * n for n in range(args.prelude_edits)]
+        prefixes += [prose + prefix for prefix in ["\\", "\\i", "\\in", "\\inp"]]
+        for index, prefix in enumerate(prefixes):
             due = typing + index * args.interval_ms / 1000
             while time.perf_counter() < due:
                 receive(max(0, min(.02, due - time.perf_counter())))
@@ -143,12 +146,14 @@ def main():
     parser.add_argument("--document", default="main.tex")
     parser.add_argument("--needle", default=r"\maketitle")
     parser.add_argument("--interval-ms", type=float, default=350)
+    parser.add_argument("--prelude-edits", type=int, default=0,
+                        help="type this many prose edits before requesting the final command")
     parser.add_argument("--runs", type=int, default=3)
     parser.add_argument("--timeout", type=float, default=90)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
-    if args.runs < 1 or args.interval_ms < 0 or args.timeout <= 0:
-        parser.error("runs/timeout must be positive; interval must be nonnegative")
+    if args.runs < 1 or args.interval_ms < 0 or args.timeout <= 0 or args.prelude_edits < 0:
+        parser.error("runs/timeout must be positive; interval/prelude-edits must be nonnegative")
     binaries = {name: getattr(args, name).resolve(strict=True) for name in ["before", "after"]}
     samples = []
     with tempfile.TemporaryDirectory(prefix="texquill-load-") as directory:
@@ -166,7 +171,7 @@ def main():
             print(json.dumps({"run": run, **{name: round(results[name]["completion_ms"], 2) for name in order}}), flush=True)
     report = {"binaries": {name: {"sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
                            for name, path in binaries.items()},
-              "interval_ms": args.interval_ms, "samples": samples,
+              "interval_ms": args.interval_ms, "prelude_edits": args.prelude_edits, "samples": samples,
               "median_ms": {name: statistics.median(run[name]["completion_ms"] for run in samples)
                             for name in binaries}}
     args.output.parent.mkdir(parents=True, exist_ok=True)

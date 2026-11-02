@@ -15991,6 +15991,103 @@ fn file_url_rename_requests_preserve_destinations_in_versioned_edits() {
 }
 
 #[test]
+fn queued_edit_batches_keep_intervening_queries_and_malformed_tail_ordered() {
+    use texquill::text::Text;
+    let directory = tempfile::tempdir().unwrap();
+    let uri = Url::from_file_path(directory.path().join("main.tex")).unwrap();
+    std::fs::write(uri.to_file_path().unwrap(), "{broken").unwrap();
+    for (name, source) in [
+        ("first.tex", r"\newcommand{\pair}[1]{#1}"),
+        ("second.tex", r"\newcommand{\pair}[2]{#1#2}"),
+    ] {
+        std::fs::write(directory.path().join(name), source).unwrap();
+    }
+    let mut server = Server::start();
+    server.request(
+        1,
+        "initialize",
+        json!({"rootUri":Url::from_directory_path(directory.path()).unwrap(),
+        "capabilities":{"workspace":{"applyEdit":true},"textDocument":{"diagnostic":{}}},
+        "initializationOptions":{"distribution":{"enabled":false}}}),
+    );
+    server.notify("initialized", json!({}));
+    server.notify(
+        "textDocument/didOpen",
+        json!({"textDocument":{
+        "uri":uri,"languageId":"latex","version":1,"text":"{broken"}}),
+    );
+    let report = server.request(
+        2,
+        "textDocument/diagnostic",
+        json!({"textDocument":{"uri":uri}}),
+    );
+    let diagnostic = report["items"][0].clone();
+    let actions = server.request(3, "textDocument/codeAction", json!({
+        "textDocument":{"uri":uri},"range":diagnostic["range"],"context":{"diagnostics":[diagnostic]}}));
+    // Hold a turn until the complete input burst has been received.
+    server.send(
+        json!({"jsonrpc":"2.0","id":4,"method":"workspace/executeCommand",
+        "params":{"command":actions[0]["command"],"arguments":actions[0]["arguments"]}}),
+    );
+    let apply = server.until(|message| message["method"] == "workspace/applyEdit");
+    let first = r"\documentclass{article}\input{first}😀\pair{one}";
+    server.notify(
+        "textDocument/didChange",
+        json!({"textDocument":{"uri":uri,"version":2},"contentChanges":[{"text":first}]}),
+    );
+    server.send(json!({"jsonrpc":"2.0","id":5,"method":"textDocument/signatureHelp","params":{
+        "textDocument":{"uri":uri},"position":Text::new(first.into()).position(first.find("one").unwrap()+1)}}));
+    let at = first.find("first").unwrap();
+    server.notify(
+        "textDocument/didChange",
+        json!({"textDocument":{"uri":uri,"version":3},
+        "contentChanges":[{"range":Text::new(first.into()).range(at,at+5),"text":"second"}]}),
+    );
+    let second = first.replace("first", "second");
+    server.notify("textDocument/didChange", json!({"textDocument":{"uri":uri,"version":4},
+        "contentChanges":[{"range":Text::new(second.clone()).range(second.len(),second.len()),"text":"% final"}]}));
+    server.notify(
+        "textDocument/didChange",
+        json!({"textDocument":{"uri":uri,"version":5},"contentChanges":"malformed"}),
+    );
+    server.send(json!({"jsonrpc":"2.0","id":6,"method":"textDocument/signatureHelp","params":{
+        "textDocument":{"uri":uri},"position":Text::new(second).position(first.find("one").unwrap()+2)}}));
+    server.send(
+        json!({"jsonrpc":"2.0","id":99,"method":"textDocument/hover","params":{
+        "textDocument":{"uri":uri},"position":{"line":0,"character":0}}}),
+    );
+    server.notify("$/cancelRequest", json!({"id":99}));
+    assert_eq!(
+        server.until(|message| message["id"] == 99)["error"]["code"],
+        -32800
+    );
+    server.send(json!({"jsonrpc":"2.0","id":apply["id"],"result":{"applied":true}}));
+    assert_eq!(
+        server.until(|message| message["id"] == 5)["result"]["signatures"][0]["parameters"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        server.until(|message| message["id"] == 6)["result"]["signatures"][0]["parameters"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    let reports = server.request(7, "workspace/diagnostic", json!({"previousResultIds":[]}));
+    assert!(reports["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|item| item["uri"] == uri.as_str() && item["version"] == 4));
+    server.request(8, "shutdown", Value::Null);
+    server.notify("exit", Value::Null);
+    server.wait_exit(0);
+}
+
+#[test]
 fn queued_cancellations_release_capacity_without_overtaking_source_updates() {
     let mut server = Server::start();
     let uri = Url::parse("untitled:queued-cancellation.tex").unwrap();

@@ -50,6 +50,22 @@ and disables builds and distribution discovery, as above. JSON includes binary
 hashes and request timings/errors. Editor menu timing needs a separate real
 Neovim check; this protocol workload does not measure rendering.
 
+To cover accumulated work after rapid typing, add prose edits before the final
+command and shorten the interval. All incremental document versions remain in
+the stream, including the background requests between them:
+
+```sh
+python3 benchmarks/completion_load.py /path/to/project \
+  --before target/benchmarks/before --after target/release/texquill \
+  --prelude-edits 20 --interval-ms 50 \
+  --output target/benchmarks/rapid-completion.json
+```
+
+For a longer stress case, use `--prelude-edits 80 --interval-ms 20`. The JSON
+records both settings. Compare final response latency after stopping typing;
+cancelled intermediate responses do not establish that queued source refreshes
+were also coalesced.
+
 ## Generated editing sessions
 
 By default, three sizes of deterministically generated projects are measured: small is 1 chapter and 16 sections per chapter; medium is 4 chapters and 32 sections per chapter; large is 8 chapters and 64 sections per chapter. Each project contains the main document, chapter files and BibTeX database. The text contains Chinese, emoji, mathematical environment, user macros, cross-file labels and citations. Projects are all below the default index budget; the test rejects index truncation.

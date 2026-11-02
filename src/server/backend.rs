@@ -73,6 +73,7 @@ pub struct Backend {
     external_tasks: tasks::Tasks,
     queries: queries::Queries,
     shutdown_requested: AtomicBool,
+    pending_change_publish: AtomicBool,
     semantic_cache: Mutex<semantic_cache::Cache>,
     diagnostic_cache: Arc<Mutex<diagnostic::Cache>>,
 }
@@ -88,6 +89,7 @@ impl Backend {
             client,
             workspace,
             shutdown_requested: AtomicBool::new(false),
+            pending_change_publish: AtomicBool::new(false),
             semantic_cache: Mutex::new(semantic_cache::Cache::default()),
             diagnostic_cache: Arc::new(Mutex::new(diagnostic::Cache::default())),
         }
@@ -149,6 +151,9 @@ impl Backend {
         &self,
         query: impl FnOnce(&Workspace) -> T + Send + 'static,
     ) -> Result<T> {
+        if self.workspace.obsolete_background_inputs().await {
+            return Err(content_modified());
+        }
         let (workspace, revision) = {
             let workspace = self.workspace.read().await;
             (workspace.clone(), self.workspace.revision())
@@ -894,7 +899,7 @@ impl Backend {
 
     pub(crate) async fn did_change(&self, params: DidChangeTextDocumentParams) {
         let uri = document_uri(params.text_document.uri);
-        let mut workspace = self.workspace.write().await;
+        let mut workspace = self.workspace.write_changes().await;
         let Some(doc) = workspace.documents.get(&uri) else {
             return;
         };
@@ -917,9 +922,30 @@ impl Backend {
         let updated = doc.with_text(&uri, text.source, Some(params.text_document.version));
         workspace.documents.insert(uri.clone(), updated);
         workspace.clear_build_diagnostics(&uri);
-        workspace.load_dependencies(&uri, 0);
+        workspace.defer_dependencies(uri);
+        self.pending_change_publish.store(true, Ordering::SeqCst);
         drop(workspace);
-        self.publish_open().await;
+        if !self.workspace.has_queued_changes() {
+            self.finish_changes().await;
+        }
+    }
+
+    pub(crate) fn queue_change(&self) -> crate::project::store::QueuedChange {
+        self.workspace.queue_change()
+    }
+
+    pub(crate) async fn finish_changes(&self) {
+        if self.workspace.has_queued_changes() {
+            return;
+        }
+        let mut workspace = self.workspace.write_changes().await;
+        if workspace.has_pending_dependencies() {
+            workspace.refresh_pending_dependencies();
+        }
+        drop(workspace);
+        if self.pending_change_publish.swap(false, Ordering::SeqCst) {
+            self.publish_open().await;
+        }
     }
 
     pub(crate) async fn did_save(&self, params: DidSaveTextDocumentParams) {
@@ -1229,6 +1255,9 @@ impl Backend {
         params: DocumentDiagnosticParams,
     ) -> Result<DocumentDiagnosticReportResult> {
         validate_diagnostic_identifier(params.identifier.as_deref())?;
+        if self.workspace.obsolete_diagnostic_inputs().await {
+            return Err(diagnostic_modified());
+        }
         let uri = document_uri(params.text_document.uri);
         let workspace = self.workspace.clone().read_owned().await;
         let previous = params
@@ -1263,6 +1292,9 @@ impl Backend {
         params: WorkspaceDiagnosticParams,
     ) -> Result<WorkspaceDiagnosticReportResult> {
         validate_diagnostic_identifier(params.identifier.as_deref())?;
+        if self.workspace.obsolete_diagnostic_inputs().await {
+            return Err(diagnostic_modified());
+        }
         let previous: std::collections::BTreeMap<_, _> = params
             .previous_result_ids
             .into_iter()
@@ -1795,6 +1827,142 @@ mod read_query_tests {
     use super::*;
     use std::time::Duration;
     use tokio::sync::oneshot;
+
+    #[tokio::test]
+    async fn intermediate_pull_reports_only_skip_refreshable_clients() {
+        for refresh in [false, true] {
+            let (client, _outgoing) = Client::new();
+            let backend = Backend::new(client);
+            let uri = Url::parse("untitled:batched-diagnostics.tex").unwrap();
+            {
+                let mut workspace = backend.workspace.write().await;
+                workspace.diagnostic_delivery = diagnostic::Delivery::new(true, refresh);
+                workspace.documents.insert(
+                    uri.clone(),
+                    workspace::Document::new(&uri, "{broken".into(), Some(1)),
+                );
+            }
+            let queued = backend.queue_change();
+            backend.did_change(serde_json::from_value(serde_json::json!({
+                "textDocument":{"uri":uri,"version":2},"contentChanges":[{"text":"balanced"}]
+            })).unwrap()).await;
+            let params =
+                || serde_json::from_value(serde_json::json!({"textDocument":{"uri":uri}})).unwrap();
+            let result = backend.diagnostic(params()).await;
+            if refresh {
+                assert_eq!(i64::from(result.unwrap_err().code), -32802);
+                assert!(backend
+                    .workspace
+                    .write_changes()
+                    .await
+                    .has_pending_dependencies());
+            } else {
+                assert_eq!(
+                    serde_json::to_value(result.unwrap()).unwrap()["items"],
+                    serde_json::json!([])
+                );
+                assert!(!backend
+                    .workspace
+                    .write_changes()
+                    .await
+                    .has_pending_dependencies());
+            }
+            drop(queued);
+            backend.finish_changes().await;
+            assert_eq!(
+                serde_json::to_value(backend.diagnostic(params()).await.unwrap()).unwrap()["items"],
+                serde_json::json!([])
+            );
+            assert!(!backend.pending_change_publish.load(Ordering::SeqCst));
+        }
+    }
+
+    #[tokio::test]
+    async fn queued_incremental_changes_skip_intermediate_includes_but_keep_ordered_queries_fresh()
+    {
+        let directory = tempfile::tempdir().unwrap();
+        let uri = Url::from_file_path(directory.path().join("main.tex")).unwrap();
+        let skipped = uri.join("skipped.tex").unwrap();
+        let required = uri.join("required.tex").unwrap();
+        std::fs::write(skipped.to_file_path().unwrap(), r"\label{skipped}").unwrap();
+        std::fs::write(required.to_file_path().unwrap(), r"\label{required}").unwrap();
+        let (client, _outgoing) = Client::new();
+        let backend = Backend::new(client);
+        backend.workspace.write().await.documents.insert(
+            uri.clone(),
+            workspace::Document::new(&uri, "😀".into(), Some(1)),
+        );
+        let queued = backend.queue_change();
+        let change = |version, changes| {
+            serde_json::from_value(serde_json::json!({
+                "textDocument":{"uri":uri,"version":version},"contentChanges":changes
+            }))
+            .unwrap()
+        };
+        backend
+            .did_change(change(
+                2,
+                serde_json::json!([{"range":{
+            "start":{"line":0,"character":2},"end":{"line":0,"character":2}
+        },"text":r"\input{skipped}"}]),
+            ))
+            .await;
+        {
+            let inputs = backend.workspace.write_changes().await;
+            assert!(inputs.has_pending_dependencies());
+            assert!(!inputs.documents.contains_key(&skipped));
+        }
+        assert_eq!(
+            i64::from(
+                backend
+                    .read_background_query(|_| panic!("obsolete view executed"))
+                    .await
+                    .unwrap_err()
+                    .code
+            ),
+            -32801
+        );
+        // A genuine query between edits must still see its wire-ordered graph.
+        assert!(backend
+            .read_query({
+                let uri = skipped.clone();
+                move |ws| ws.documents.contains_key(&uri)
+            })
+            .await
+            .unwrap());
+        backend
+            .did_change(change(
+                3,
+                serde_json::json!([{"range":{
+            "start":{"line":0,"character":9},"end":{"line":0,"character":16}
+        },"text":"required"}]),
+            ))
+            .await;
+        assert!(!backend
+            .workspace
+            .write_changes()
+            .await
+            .documents
+            .contains_key(&required));
+        // Invalid ranges preserve the last valid incremental revision. Dropping
+        // the final receipt must still flush/publish that earlier valid edit.
+        backend
+            .did_change(change(
+                4,
+                serde_json::json!([{"range":{
+            "start":{"line":99,"character":0},"end":{"line":99,"character":0}
+        },"text":"invalid"}]),
+            ))
+            .await;
+        drop(queued);
+        backend.finish_changes().await;
+        let inputs = backend.workspace.read().await;
+        assert_eq!(inputs.documents[&uri].text.source, "😀\\input{required}");
+        assert_eq!(inputs.documents[&uri].version, Some(3));
+        assert!(inputs.documents.contains_key(&required));
+        assert!(!inputs.has_pending_dependencies());
+        assert!(!backend.pending_change_publish.load(Ordering::SeqCst));
+    }
 
     #[tokio::test]
     async fn obsolete_background_queues_do_not_block_completion_or_execute_old_snapshots() {

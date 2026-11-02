@@ -471,6 +471,7 @@ where
                 drop(incoming);
             });
         } else {
+            let change = (method == "textDocument/didChange").then(|| backend.queue_change());
             handlers.spawn(queue.ordered(async move {
                 if method == "exit" {
                     let _ = exit.send(i32::from(!backend.is_shutdown())).await;
@@ -482,6 +483,13 @@ where
                     notification(&backend, &phase, &initialized, &method, params),
                 )
                 .await;
+                if change.is_some() {
+                    drop(change);
+                    // Flush once for the newest received source revision.
+                    // An intervening non-cancelled request can still force a
+                    // fresh ordered snapshot through WorkspaceStore::read.
+                    backend.finish_changes().await;
+                }
             }));
         }
     };
