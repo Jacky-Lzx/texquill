@@ -20,6 +20,14 @@ Background compilation command, configuration, status and product consistency ch
 
 The editing function does not depend on TeX; compilation requires the corresponding tools in `PATH` of the language server. `latexmk` is used by default, and the engine sequentially uses explicit `build.engine`, the main file program directive, and the statically recognized `$pdf_mode` in the project rc, otherwise pdfLaTeX is used. The output directory preferentially uses `$out_dir` that can be statically identified in `.latexmkrc` (or `latexmkrc`) next to the root document, otherwise `build/texquill/` is used; the explicit `build.outputDirectory` takes precedence. For the recognition range, see [Compile Configuration](build-configuration.md). Save the project file before compiling. The server will refuse to compile dependencies with unsaved content to avoid inconsistency between diagnostics and editor content.
 
+Build preparation captures the ordered editor state, then scans dependencies,
+resolves tool configuration and checks saved inputs on a background workspace.
+Editing and completion can continue during preparation. Source reloads are
+merged only when their captured document revision is still current; they never
+replace a newer buffer edit. Preparing builds participate in cancellation,
+shutdown and rebuild queueing. Saves received during preparation are checked
+against the prepared inputs before deciding whether a follow-up is necessary.
+
 Compilation can be triggered in Neovim like this:
 
 ```lua

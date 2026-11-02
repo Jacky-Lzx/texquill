@@ -6,6 +6,7 @@ impl BuildManager {
         let BuildInput {
             root: root_uri,
             root_path,
+            prepared_documents: _,
             snapshots,
             file_snapshots,
             open_aliases,

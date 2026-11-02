@@ -27,6 +27,22 @@ impl Revisions {
     }
 }
 
+/// Conditional document replacements prepared outside the live workspace lock.
+#[derive(Default)]
+pub(crate) struct Updates(Vec<DocumentUpdate>);
+
+struct DocumentUpdate {
+    uri: Url,
+    before: Option<Weak<Document>>,
+    after: Option<Arc<Document>>,
+}
+
+impl Updates {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
 pub type Iter<'a> = std::iter::Map<
     btree_map::Iter<'a, Url, Arc<Document>>,
     fn((&'a Url, &'a Arc<Document>)) -> (&'a Url, &'a Document),
@@ -56,6 +72,48 @@ impl Documents {
                     .get(uri)
                     .is_some_and(|other| Arc::ptr_eq(doc, other))
             })
+    }
+
+    pub(crate) fn updates_since(&self, before: &Self) -> Updates {
+        let mut changes = Vec::new();
+        for uri in self
+            .0
+            .keys()
+            .chain(before.0.keys())
+            .collect::<std::collections::BTreeSet<_>>()
+        {
+            let old = before.0.get(uri);
+            let new = self.0.get(uri);
+            if !old.zip(new).is_some_and(|(old, new)| Arc::ptr_eq(old, new)) {
+                changes.push(DocumentUpdate {
+                    uri: uri.clone(),
+                    before: old.map(Arc::downgrade),
+                    after: new.cloned(),
+                });
+            }
+        }
+        Updates(changes)
+    }
+
+    /// Never replace an editor revision or a reload which arrived after capture.
+    pub(crate) fn apply_updates(&mut self, updates: Updates) -> std::collections::BTreeSet<Url> {
+        let mut changed = std::collections::BTreeSet::new();
+        for DocumentUpdate { uri, before, after } in updates.0 {
+            let current = self.0.get(&uri);
+            if before.as_ref().map(Weak::as_ptr) != current.map(Arc::as_ptr) {
+                continue;
+            }
+            match after {
+                Some(doc) => {
+                    self.0.insert(uri.clone(), doc);
+                }
+                None => {
+                    self.0.remove(&uri);
+                }
+            }
+            changed.insert(uri);
+        }
+        changed
     }
 
     pub fn get(&self, uri: &Url) -> Option<&Document> {
