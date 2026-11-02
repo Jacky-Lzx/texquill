@@ -228,7 +228,8 @@ impl WorkspaceStore {
         if !self.has_queued_changes() {
             return false;
         }
-        let workspace = self.workspace.read().await;
+        let inputs = self.completion_inputs();
+        let workspace = &inputs.workspace;
         workspace.has_pending_dependencies() && self.has_queued_changes()
     }
 
@@ -238,7 +239,8 @@ impl WorkspaceStore {
         }
         // Inspect delivery metadata without flushing intermediate source
         // versions. Clients without refresh retain ordered snapshot reports.
-        let workspace = self.workspace.read().await;
+        let inputs = self.completion_inputs();
+        let workspace = &inputs.workspace;
         workspace.has_pending_dependencies()
             && workspace.diagnostic_delivery.supports_refresh()
             && self.has_queued_changes()

@@ -27,10 +27,23 @@ pub(crate) struct Completion {
     requested: Arc<tokio::sync::Notify>,
 }
 impl Completion {
+    pub(crate) fn ensure_scheduled(
+        &self,
+        workspace: WorkspaceStore,
+        queries: Queries,
+        client: Client,
+        pending: Arc<AtomicBool>,
+    ) {
+        if self.state.lock().unwrap().task.is_none() {
+            self.schedule(workspace, queries, client, pending, false, None);
+        }
+    }
+
     pub(crate) fn remember_path(&self, prepared: crate::language::path_cache::Prepared) {
         self.cache.lock().unwrap().insert_paths(prepared);
     }
-    pub(crate) fn covers(&self, ws: &crate::project::workspace::Workspace, epoch: u64) -> bool {
+    #[cfg(test)]
+    fn covers(&self, ws: &crate::project::workspace::Workspace, epoch: u64) -> bool {
         let cache = self.cache.lock().unwrap();
         ws.pending_dependencies
             .iter()
@@ -117,27 +130,57 @@ impl Completion {
                     }
                 }
             };
-            let (snapshot, revision, epoch) = {
+            let (snapshot, revision, epoch, source_revision) = {
                 let inputs = workspace.read_unindexed().await;
                 (
                     inputs.clone(),
                     workspace.revision(),
                     workspace.completion_epoch(),
+                    workspace.source_revision(),
                 )
             };
+            let before = snapshot.documents.revisions();
+            let source_inputs = workspace.clone();
             let cache = self.cache.clone();
             let analysis = queries.analyses.clone();
             let work = move |cancel: &crate::analysis::AnalysisContext| {
-                crate::analysis::AnalysisContext::new().run(|context| {
+                let epoch_inputs = source_inputs.clone();
+                crate::analysis::AnalysisContext::cancellable(move || {
+                    epoch_inputs.completion_epoch() != epoch
+                })
+                .run(|context| {
+                    context.check()?;
                     let mut snapshot = snapshot;
+                    if snapshot.has_pending_dependencies()
+                        && source_inputs.source_revision() != source_revision
+                    {
+                        return Err(crate::rpc::Error::request_cancelled());
+                    }
                     analysis.command_candidates().prepare(&snapshot);
-                    let updates = crate::analysis::AnalysisContext::for_workspace(
-                        &snapshot,
-                        epoch,
-                        revision,
-                        analysis.clone(),
-                    );
-                    let changed = updates.run(|_| snapshot.refresh_pending_dependencies());
+                    let changed = if snapshot.has_pending_dependencies() {
+                        let updates = crate::analysis::AnalysisContext::for_workspace(
+                            &snapshot,
+                            epoch,
+                            revision,
+                            analysis.clone(),
+                        );
+                        let inputs = source_inputs.clone();
+                        crate::analysis::AnalysisContext::cancellable(move || {
+                            inputs.source_revision() != source_revision
+                                || inputs.completion_epoch() != epoch
+                        })
+                        .run(|context| {
+                            context.check()?;
+                            let changed = updates.run(|_| snapshot.refresh_pending_dependencies());
+                            context.check()?;
+                            Ok(changed)
+                        })?
+                    } else {
+                        false
+                    };
+                    // Candidate preparation for an already propagated snapshot
+                    // may survive ordinary typing. Its canonical-input proof is
+                    // checked against the current text before insertion below.
                     let shared = crate::analysis::AnalysisContext::for_workspace(
                         &snapshot, epoch, revision, analysis,
                     );
@@ -192,10 +235,15 @@ impl Completion {
             if let Ok((snapshot, changed, prepared, paths)) = result {
                 let delivery = snapshot.diagnostic_delivery.clone();
                 let mut inputs = workspace.write_prepared().await;
-                let current =
-                    workspace.revision() == revision && workspace.completion_epoch() == epoch;
+                let current = workspace.source_revision() == source_revision
+                    && workspace.completion_epoch() == epoch
+                    && before.current(&inputs.documents);
                 if current && changed && inputs.has_pending_dependencies() {
-                    *inputs = snapshot;
+                    // Preparation owns source propagation, not concurrent build
+                    // diagnostics/PDF history or independent project metadata.
+                    inputs.documents = snapshot.documents;
+                    inputs.pending_dependencies = snapshot.pending_dependencies;
+                    inputs.index_truncated = snapshot.index_truncated;
                 }
                 for entry in prepared {
                     if entry.valid_for(&inputs, workspace.completion_epoch()) {

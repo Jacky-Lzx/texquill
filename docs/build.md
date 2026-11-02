@@ -40,6 +40,16 @@ publishes its current text before the next ordered request; macro/context change
 still invalidate incompatible candidates. PDF history and diagnostic-only build
 updates retain prepared candidates when source and dependency inputs agree.
 
+For clients supporting diagnostic refresh, rapid edits share the latest
+background dependency preparation even when completion has no reusable cache
+entry. Automatic views yield their ordered turn while waiting and discard
+superseded inputs. An interactive cache miss analyses its captured workspace in
+the worker pool rather than propagating dependencies under the live write lock.
+Dependency propagation cancels obsolete source snapshots and merges source data
+without replacing concurrent build diagnostics or artifact history. Candidate
+template preparation may finish across ordinary text edits; its canonical-input
+proof must still match the current text before those candidates are retained.
+
 Compilation can be triggered in Neovim like this:
 
 ```lua

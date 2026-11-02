@@ -593,7 +593,7 @@ impl BuildManager {
 
     /// Queue changed saved inputs once; identical saves reuse the active build.
     pub async fn on_save(&self, uri: Url) -> Result<()> {
-        let workspace = self.workspace.read().await;
+        let workspace = self.workspace.read_unindexed().await;
         let root = workspace
             .root_document(&uri)
             .map_err(Error::invalid_params)?;

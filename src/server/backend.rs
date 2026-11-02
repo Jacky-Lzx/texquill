@@ -147,7 +147,7 @@ impl Backend {
         query: impl FnOnce(&Workspace) -> T + Send + 'static,
     ) -> Result<T> {
         let (workspace, epoch, revision) = {
-            let inputs = self.workspace.read().await;
+            let inputs = self.workspace.read_unindexed().await;
             (
                 inputs.clone(),
                 self.workspace.completion_epoch(),
@@ -158,6 +158,16 @@ impl Backend {
         dispatch::release();
         self.queries
             .run(move |_| {
+                let mut workspace = workspace;
+                if workspace.has_pending_dependencies() {
+                    let context = crate::analysis::AnalysisContext::for_workspace(
+                        &workspace,
+                        epoch,
+                        revision,
+                        analysis.clone(),
+                    );
+                    context.run(|_| workspace.refresh_pending_dependencies());
+                }
                 Ok(crate::analysis::AnalysisContext::for_workspace(
                     &workspace, epoch, revision, analysis,
                 )
@@ -385,7 +395,7 @@ impl Backend {
     }
 
     async fn lint(&self, uri: &Url) {
-        let workspace = self.workspace.read().await;
+        let workspace = self.workspace.read_unindexed().await;
         let config = workspace.settings(uri).diagnostics.chktex.clone();
         let Some(doc) = workspace
             .documents
@@ -411,7 +421,7 @@ impl Backend {
             Ok(mut task) => task.wait().await,
             Err(error) => Err(error),
         };
-        let mut workspace = self.workspace.write().await;
+        let mut workspace = self.workspace.write_prepared().await;
         if workspace.settings(uri).diagnostics.chktex != config
             || !workspace.documents.get(uri).is_some_and(|doc| {
                 doc.version == version && doc.version.is_some() && doc.text.source == source
@@ -459,16 +469,18 @@ impl Backend {
             if self.workspace.source_revision() != source {
                 return Err(content_modified());
             }
-            if !inputs.has_pending_dependencies()
-                || !inputs.diagnostic_delivery.supports_refresh()
-                || !self
-                    .completion
-                    .covers(&inputs, self.workspace.completion_epoch())
+            if !inputs.has_pending_dependencies() || !inputs.diagnostic_delivery.supports_refresh()
             {
                 return Ok(());
             }
             drop(inputs);
             dispatch::release();
+            self.completion.ensure_scheduled(
+                self.workspace.clone(),
+                self.queries.clone(),
+                self.client.clone(),
+                self.pending_change_publish.clone(),
+            );
             changed.await;
         }
     }
@@ -579,7 +591,7 @@ impl Backend {
     }
 
     async fn publish_affected(&self, affected: std::collections::BTreeSet<Url>) {
-        let workspace = self.workspace.read().await;
+        let workspace = self.workspace.read_unindexed().await;
         let delivery = workspace.diagnostic_delivery.clone();
         if delivery.is_pull() {
             drop(workspace);
@@ -1026,11 +1038,7 @@ impl Backend {
             return;
         }
         let mut workspace = self.workspace.write_prepared().await;
-        if workspace.has_pending_dependencies()
-            && workspace.diagnostic_delivery.supports_refresh()
-            && self
-                .completion
-                .covers(&workspace, self.workspace.completion_epoch())
+        if workspace.has_pending_dependencies() && workspace.diagnostic_delivery.supports_refresh()
         {
             drop(workspace);
             self.prepare_completion();
@@ -1054,7 +1062,7 @@ impl Backend {
     pub(crate) async fn did_save(&self, params: DidSaveTextDocumentParams) {
         let uri = document_uri(params.text_document.uri);
         if let Some(source) = params.text {
-            let mut workspace = self.workspace.write().await;
+            let mut workspace = self.workspace.write_changes().await;
             if let Some(doc) = workspace
                 .documents
                 .get(&uri)
@@ -1064,11 +1072,18 @@ impl Backend {
 
                 workspace.documents.insert(uri.clone(), updated);
                 workspace.clear_build_diagnostics(&uri);
-                workspace.load_dependencies(&uri, 0);
+                workspace.defer_dependencies(uri.clone());
+                self.pending_change_publish.store(true, Ordering::SeqCst);
             }
         }
         self.publish_open().await;
-        let on_save = self.workspace.read().await.settings(&uri).build.on_save;
+        let on_save = self
+            .workspace
+            .read_unindexed()
+            .await
+            .settings(&uri)
+            .build
+            .on_save;
         if on_save {
             if let Err(error) = self.builds.on_save(uri.clone()).await {
                 self.client
@@ -2024,6 +2039,105 @@ mod read_query_tests {
         .await
         .unwrap();
         position
+    }
+
+    #[tokio::test]
+    async fn cold_preparation_coalesces_changes_without_blocking_ordered_views_or_edits() {
+        let directory = tempfile::tempdir().unwrap();
+        let uri = Url::from_file_path(directory.path().join("main.tex")).unwrap();
+        let child = uri.join("child.tex").unwrap();
+        std::fs::write(
+            child.to_file_path().unwrap(),
+            "\\newcommand{\\obsolete}{Old}\n",
+        )
+        .unwrap();
+        let (client, _outgoing) = Client::new();
+        let backend = Arc::new(Backend::new(client));
+        let original = "\\begin{document}\n\\inp\n\\end{document}\n";
+        {
+            let mut inputs = backend.workspace.write().await;
+            inputs.diagnostic_delivery = diagnostic::Delivery::new(true, true);
+            inputs.documents.insert(
+                uri.clone(),
+                workspace::Document::new(&uri, original.into(), Some(1)),
+            );
+        }
+        let mut workers = Vec::new();
+        let mut finishes = Vec::new();
+        for _ in 0..4 {
+            let queries = backend.queries.clone();
+            let (started, start) = oneshot::channel();
+            let (finish, finished) = oneshot::channel();
+            workers.push(tokio::spawn(async move {
+                queries
+                    .run(move |_| {
+                        let _ = started.send(());
+                        let _ = finished.blocking_recv();
+                        Ok(())
+                    })
+                    .await
+            }));
+            start.await.unwrap();
+            finishes.push(finish);
+        }
+        backend.did_change(serde_json::from_value(serde_json::json!({
+            "textDocument":{"uri":uri,"version":2}, "contentChanges":[{"text":original.replace("\\inp", "\\input{child}")}]
+        })).unwrap()).await;
+        {
+            let inputs = backend.workspace.read_unindexed().await;
+            assert!(inputs.has_pending_dependencies());
+            assert!(!inputs.documents.contains_key(&child));
+        }
+        let mut queue = dispatch::RequestQueue::default();
+        let reader = backend.clone();
+        let view = tokio::spawn(queue.ordered(async move {
+            reader
+                .read_background_query(|_| panic!("superseded automatic view executed"))
+                .await
+        }));
+        let writer = backend.clone();
+        let main = uri.clone();
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            queue.ordered(async move {
+                writer.did_change(serde_json::from_value(serde_json::json!({
+                "textDocument":{"uri":main,"version":3}, "contentChanges":[{"text":original}]
+            })).unwrap()).await;
+            }),
+        )
+        .await
+        .expect("cold automatic view blocked a newer edit");
+        let error = tokio::time::timeout(Duration::from_secs(1), view)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(i64::from(error.code), -32801);
+        for finish in finishes {
+            let _ = finish.send(());
+        }
+        for worker in workers {
+            worker.await.unwrap().unwrap();
+        }
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if !backend
+                    .workspace
+                    .read_unindexed()
+                    .await
+                    .has_pending_dependencies()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let inputs = backend.workspace.read_unindexed().await;
+        assert_eq!(inputs.documents[&uri].version, Some(3));
+        assert!(!inputs.documents.contains_key(&child));
+        backend.completion.close();
     }
 
     #[tokio::test]
