@@ -74,6 +74,25 @@ impl Documents {
             })
     }
 
+    pub(crate) fn same_sources_for(
+        &self,
+        other: &Self,
+        scope: &std::collections::BTreeSet<Url>,
+    ) -> bool {
+        scope
+            .iter()
+            .all(|uri| match (self.get(uri), other.get(uri)) {
+                (Some(left), Some(right)) => {
+                    std::ptr::eq(left, right)
+                        || left.version == right.version
+                            && left.kind == right.kind
+                            && left.text.source == right.text.source
+                }
+                (None, None) => true,
+                _ => false,
+            })
+    }
+
     pub(crate) fn updates_since(&self, before: &Self) -> Updates {
         let mut changes = Vec::new();
         for uri in self

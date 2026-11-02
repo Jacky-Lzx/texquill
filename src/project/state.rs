@@ -43,3 +43,31 @@ pub struct ProjectState {
     pub build_checks: BTreeMap<Url, std::sync::Arc<crate::compilation::file_checks::Snapshot>>,
     pub pdf_checks: BTreeMap<Url, std::sync::Arc<crate::compilation::file_checks::Snapshot>>,
 }
+
+impl ProjectState {
+    /// Only this root's build observations belong to a completed build. Other
+    /// roots and independent lint reports may have changed during analysis.
+    pub(crate) fn merge_build(&mut self, root: &Url, update: &mut Self) {
+        macro_rules! merge {
+            ($($field:ident),* $(,)?) => { $(
+                match update.$field.remove(root) {
+                    Some(value) => { self.$field.insert(root.clone(), value); }
+                    None => { self.$field.remove(root); }
+                }
+            )* };
+        }
+        merge!(
+            build_diagnostics,
+            build_diagnostic_sources,
+            recorded_inputs,
+            recorded_binary_inputs,
+            recorded_bindings,
+            bibliography_inputs,
+            bibliography_databases,
+            bibliography_bindings,
+            bibliography_checks,
+            build_checks,
+            pdf_checks
+        );
+    }
+}

@@ -24,6 +24,7 @@ use tokio::sync::Notify;
 use crate::compilation::build::{reject_outdated_pdf, run_with_mode, Outcome};
 mod completion;
 mod preparation;
+mod publication;
 
 pub enum BuildStarted {}
 impl notification::Notification for BuildStarted {

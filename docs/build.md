@@ -28,6 +28,12 @@ replace a newer buffer edit. Preparing builds participate in cancellation,
 shutdown and rebuild queueing. Saves received during preparation are checked
 against the prepared inputs before deciding whether a follow-up is necessary.
 
+Completed builds also prepare dependency reloads, file checks and diagnostic
+locations in the background. Publication merges only that root's observations
+and still-current document revisions. An edit arriving during this preparation
+discards outdated diagnostics while preserving the produced PDF's input history
+and other roots' build state.
+
 Compilation can be triggered in Neovim like this:
 
 ```lua

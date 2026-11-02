@@ -142,6 +142,10 @@ impl WorkspaceStore {
         self.workspace.read().await
     }
 
+    pub(crate) fn invalidate_completion(&self) {
+        self.completion_epoch.fetch_add(1, Ordering::SeqCst);
+    }
+
     pub(crate) fn completion_epoch(&self) -> u64 {
         self.completion_epoch.load(Ordering::SeqCst)
     }
