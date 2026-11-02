@@ -119,6 +119,65 @@ timeline rather than relying on the overall median to find a brief stall.
 These are protocol measurements; candidate menu timing requires a separate
 Neovim check. Each case starts a new server; use multiple rounds for variability.
 
+## Other command completion scenarios
+
+`benchmarks/completion_matrix.py` tests commands beyond `\input`: sectioning,
+text formatting, list items, fractions/Greek symbols, environment names,
+reference/citation keys, image paths, local packages, macro definitions and
+user macros. It includes immediate/paused requests after changing a macro from
+two parameters to one, plus completion in the abstract and introduction buffers.
+The fixture expects the paper layout `main.tex`, `ref.bib`,
+`Tex/0_Abstract.tex`, `Tex/1_Introduction.tex` and a `\maketitle` anchor. All
+fixture additions and edits stay in temporary copies. Local class definitions
+can legitimately produce bare section commands instead of catalog snippets.
+
+```sh
+python3 benchmarks/completion_matrix.py /path/to/paper \
+  --modes warm rapid build save --output target/benchmarks/completion-matrix.json
+```
+
+The four modes cover warmed editing, rapid prose input with automatic editor
+queries, an active build and save-triggered compilation. Build modes prime the
+dependency/recorder state first. The default controlled compiler requires only
+Python; `--compiler latexmk` uses the copied project configuration instead.
+Assertions check candidate identity, insertion text, UTF-16 edit endpoints,
+expanded snippet contents and a repeat request after a one-second pause.
+Distribution discovery is disabled; a local package/image and a distinct BibTeX
+key keep argument completion deterministic.
+
+For actual menu and acceptance checks, use the macOS/Linux PTY runner with the
+user's Neovim configuration and plugin checkouts:
+
+```sh
+python3 benchmarks/completion_matrix_ui.py /path/to/paper \
+  --modes warm rapid build save --output target/benchmarks/completion-matrix-ui
+```
+
+This runner types prefixes through configured mappings and actually accepts LSP
+candidates. It records effective rebased ranges, accepted lines, transient
+unexpected candidates, and per-key traces for failures. Rapid input writes prose
+on a separate prepared line before moving to the command context, so Enter's
+completion-accept mapping does not silently change the intended test operation.
+Build/save modes use real latexmk and the copied project configuration; the same
+self-contained-path requirements as the compilation benchmark apply.
+`--raw-backslash --cases frac alpha --modes warm` removes only the Insert-mode
+backslash mapping in the disposable editor to isolate input-mapping effects.
+It never edits the user's configuration or existing editor session. Each mode
+writes JSON plus a PTY log; an incomplete or incorrect case makes the run fail.
+`--churn-buffers` also replaces unchanged buffers between cases to stress
+revision-based cache validation; the default restores only changed contents.
+For saved-source diagnosis, `--no-watch` cancels that disposable client's file
+watchers and `--no-chktex` disables its lint tool. Neither changes user settings.
+
+Focused checks can run a single saving/reference scenario or isolate the math
+delimiter mapping without replaying the entire matrix:
+
+```sh
+python3 benchmarks/completion_matrix_ui.py /path/to/paper --modes save --cases reference
+python3 benchmarks/completion_matrix_ui.py /path/to/paper --modes warm --cases frac alpha
+python3 benchmarks/completion_matrix_ui.py /path/to/paper --modes warm --cases frac alpha --raw-backslash
+```
+
 ## Generated editing sessions
 
 By default, three sizes of deterministically generated projects are measured: small is 1 chapter and 16 sections per chapter; medium is 4 chapters and 32 sections per chapter; large is 8 chapters and 64 sections per chapter. Each project contains the main document, chapter files and BibTeX database. The text contains Chinese, emoji, mathematical environment, user macros, cross-file labels and citations. Projects are all below the default index budget; the test rejects index truncation.
