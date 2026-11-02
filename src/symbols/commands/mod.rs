@@ -357,6 +357,11 @@ pub(crate) struct ParameterSpans {
 }
 
 impl CommandShape {
+    pub(crate) fn cache_bytes(&self) -> usize {
+        self.signature.as_ref().map_or(0, grammar_signature_bytes)
+            + self.tex.as_ref().map_or(0, grammar_tex_bytes)
+    }
+
     pub(crate) fn environment_definition(
         source: &str,
         parsed: &syntax::Syntax,
@@ -1081,6 +1086,7 @@ pub(crate) struct CommandSignatures<'a> {
     detokenize_boundary_known: bool,
     identity_parameters: BTreeSet<String>,
     hook_arities: crate::symbols::hook_arguments::Arities,
+    common_grammars: std::sync::OnceLock<BTreeMap<String, Option<LiteralOperands>>>,
 }
 
 /// Possible declarations only exclude literal edits; they never establish a
@@ -1174,6 +1180,45 @@ pub(crate) struct SourceCall {
     pub certain: bool,
 }
 
+fn grammar_strings_bytes(values: &Vec<String>) -> usize {
+    values.capacity() * std::mem::size_of::<String>()
+        + values.iter().map(String::capacity).sum::<usize>()
+}
+fn grammar_signature_bytes(value: &Signature) -> usize {
+    value.name.capacity()
+        + value.documentation.capacity()
+        + value.parameters.capacity() * std::mem::size_of::<Parameter>()
+        + value
+            .parameters
+            .iter()
+            .map(|parameter| {
+                parameter.label.capacity()
+                    + match &parameter.kind {
+                        Kind::Flag(value) => value.capacity(),
+                        Kind::Delimited { open, close, .. } => open.capacity() + close.capacity(),
+                        _ => 0,
+                    }
+            })
+            .sum::<usize>()
+}
+fn grammar_tex_bytes(value: &TexOperands) -> usize {
+    grammar_strings_bytes(&value.prefix)
+        + value.delimiters.capacity() * std::mem::size_of::<Vec<String>>()
+        + value
+            .delimiters
+            .iter()
+            .map(grammar_strings_bytes)
+            .sum::<usize>()
+}
+fn grammar_literal_bytes(value: &LiteralOperands) -> usize {
+    match value {
+        LiteralOperands::Signature(value) => grammar_signature_bytes(value),
+        LiteralOperands::Tex(value) => grammar_tex_bytes(value),
+        LiteralOperands::Alias(value) | LiteralOperands::Copy(value) => value.capacity(),
+        LiteralOperands::Unknown => 0,
+    }
+}
+
 impl<'a> CommandSignatures<'a> {
     /// Retain an analysis within an immutable query without borrowing sources.
     pub(crate) fn into_owned(self) -> CommandSignatures<'static> {
@@ -1201,6 +1246,7 @@ impl<'a> CommandSignatures<'a> {
             detokenize_boundary_known: self.detokenize_boundary_known,
             identity_parameters: self.identity_parameters,
             hook_arities: self.hook_arities,
+            common_grammars: self.common_grammars,
         }
     }
 
@@ -1211,57 +1257,31 @@ impl<'a> CommandSignatures<'a> {
             Cow::Borrowed(_) => 0,
             Cow::Owned(name) => name.capacity(),
         };
-        fn strings(values: &Vec<String>) -> usize {
-            values.capacity() * std::mem::size_of::<String>()
-                + values.iter().map(String::capacity).sum::<usize>()
-        }
-        fn signature(value: &Signature) -> usize {
-            value.name.capacity()
-                + value.documentation.capacity()
-                + value.parameters.capacity() * std::mem::size_of::<Parameter>()
-                + value
-                    .parameters
-                    .iter()
-                    .map(|parameter| {
-                        parameter.label.capacity()
-                            + match &parameter.kind {
-                                Kind::Flag(value) => value.capacity(),
-                                Kind::Delimited { open, close, .. } => {
-                                    open.capacity() + close.capacity()
-                                }
-                                _ => 0,
-                            }
-                    })
-                    .sum::<usize>()
-        }
-        fn tex(value: &TexOperands) -> usize {
-            strings(&value.prefix)
-                + value.delimiters.capacity() * std::mem::size_of::<Vec<String>>()
-                + value.delimiters.iter().map(strings).sum::<usize>()
-        }
-        fn literal(value: &LiteralOperands) -> usize {
-            match value {
-                LiteralOperands::Signature(value) => signature(value),
-                LiteralOperands::Tex(value) => tex(value),
-                LiteralOperands::Alias(value) | LiteralOperands::Copy(value) => value.capacity(),
-                LiteralOperands::Unknown => 0,
-            }
-        }
         fn tree<K, V>(entries: &BTreeMap<K, V>) -> usize {
             entries.len() * (12 * std::mem::size_of::<(K, V)>() + 256)
         }
+        // Initialize before retention so lazy grammar storage is charged to
+        // the same byte budget as the declarations that produced it.
+        let common = self.common_parameter_grammars();
         std::mem::size_of::<Self>()
+            + tree(common)
+            + common
+                .iter()
+                .map(|(name, value)| {
+                    name.capacity() + value.as_ref().map_or(0, grammar_literal_bytes)
+                })
+                .sum::<usize>()
             + tree(&self.local)
             + self
                 .local
                 .iter()
-                .map(|(name, value)| key(name) + value.as_ref().map_or(0, signature))
+                .map(|(name, value)| key(name) + value.as_ref().map_or(0, grammar_signature_bytes))
                 .sum::<usize>()
             + tree(&self.tex_operands)
             + self
                 .tex_operands
                 .iter()
-                .map(|(name, value)| key(name) + value.as_ref().map_or(0, tex))
+                .map(|(name, value)| key(name) + value.as_ref().map_or(0, grammar_tex_bytes))
                 .sum::<usize>()
             + tree(&self.literal_operands)
             + self
@@ -1270,7 +1290,7 @@ impl<'a> CommandSignatures<'a> {
                 .map(|(name, values)| {
                     key(name)
                         + values.capacity() * std::mem::size_of::<LiteralOperands>()
-                        + values.iter().map(literal).sum::<usize>()
+                        + values.iter().map(grammar_literal_bytes).sum::<usize>()
                 })
                 .sum::<usize>()
             + self
@@ -1299,6 +1319,7 @@ impl<'a> CommandSignatures<'a> {
         mut self,
         documents: impl IntoIterator<Item = (&'a str, &'a syntax::Syntax)>,
     ) -> Self {
+        self.common_grammars = Default::default();
         for (name, operands) in Self::new(documents).literal_operands {
             self.literal_operands
                 .entry(name)
@@ -1328,11 +1349,20 @@ impl<'a> CommandSignatures<'a> {
     ) -> Self {
         let documents: Vec<_> = documents.into_iter().collect();
         let preliminary = Self::new(documents.iter().copied());
+        Self::source_context_with(documents, &preliminary)
+    }
+
+    /// The preliminary editing grammar must cover these exact ordered sources.
+    /// Filtering still creates a separate execution grammar with its own cache.
+    pub(crate) fn source_context_with(
+        documents: impl IntoIterator<Item = (&'a str, &'a syntax::Syntax)>,
+        preliminary: &Self,
+    ) -> Self {
         Self::collect(
             documents,
             std::iter::empty(),
             std::iter::empty(),
-            Some(&preliminary),
+            Some(preliminary),
         )
     }
 
@@ -1604,6 +1634,7 @@ impl<'a> CommandSignatures<'a> {
             detokenize_boundary_known,
             identity_parameters,
             hook_arities: crate::symbols::hook_arguments::Arities::default(),
+            common_grammars: Default::default(),
         };
         // Deferred or forwarded providers can install an unseen definition.
         // Proven displayed file commands cannot execute such a provider.
@@ -1761,20 +1792,20 @@ impl<'a> CommandSignatures<'a> {
     pub(crate) fn completion_shapes(&self) -> BTreeMap<String, Option<CommandShape>> {
         let mut result: BTreeMap<_, _> = self
             .common_parameter_grammars()
-            .into_iter()
+            .iter()
             .map(|(name, operands)| {
                 let shape = match operands {
                     Some(LiteralOperands::Signature(signature)) => Some(CommandShape {
-                        signature: Some(signature),
+                        signature: Some(signature.clone()),
                         tex: None,
                     }),
                     Some(LiteralOperands::Tex(tex)) => Some(CommandShape {
                         signature: None,
-                        tex: Some(tex),
+                        tex: Some(tex.clone()),
                     }),
                     _ => None,
                 };
-                (name.into_owned(), shape)
+                (name.to_string(), shape)
             })
             .collect();
         // A class may disable a zero-argument command with `\let\name\relax`.
@@ -2696,6 +2727,7 @@ impl<'a> CommandSignatures<'a> {
             detokenize_boundary_known: self.detokenize_boundary_known,
             identity_parameters: self.identity_parameters.clone(),
             hook_arities: self.hook_arities.clone(),
+            common_grammars: Default::default(),
         };
         shapes.inline_copy_operands(parsed);
         shapes.argument_tokens_with_literal(source, parsed, None, false, false, parameters)
@@ -2796,6 +2828,7 @@ impl<'a> CommandSignatures<'a> {
     /// unresolved, repeated or later source declarations cannot prove a copy's
     /// captured grammar. Pure forwarders retain their late-bound target.
     fn inline_copy_operands(&mut self, parsed: &syntax::Syntax) {
+        self.common_grammars = Default::default();
         let mut entries = BTreeMap::new();
         for entry in parsed.definitions.iter().chain(&parsed.environments) {
             entries
@@ -3215,7 +3248,16 @@ impl<'a> CommandSignatures<'a> {
     /// Preserve a boundary shared by every source declaration, without
     /// restoring a unique command meaning, identity body or help signature.
     /// Pure forwarders remain late-bound; captured copies do not participate.
-    fn common_parameter_grammars(&self) -> BTreeMap<Cow<'a, str>, Option<LiteralOperands>> {
+    fn common_parameter_grammars(&self) -> &BTreeMap<String, Option<LiteralOperands>> {
+        self.common_grammars.get_or_init(|| {
+            self.build_common_parameter_grammars()
+                .into_iter()
+                .map(|(name, value)| (name.into_owned(), value))
+                .collect()
+        })
+    }
+
+    fn build_common_parameter_grammars(&self) -> BTreeMap<Cow<'a, str>, Option<LiteralOperands>> {
         let mut shapes: BTreeMap<_, _> = self
             .local
             .keys()

@@ -6,6 +6,21 @@ mod tex_operand_tests {
     use crate::text::Text;
 
     #[test]
+    fn retained_parameter_grammars_refresh_when_literal_candidates_change() {
+        let first = r"\newcommand{\reader}[1]{#1}";
+        let extra = r"\renewcommand{\reader}[2]{#1#2}";
+        let parsed = syntax::Syntax::latex(&Text::new(first.into()));
+        let added = syntax::Syntax::latex(&Text::new(extra.into()));
+        let signatures = CommandSignatures::new([(first, &parsed)]);
+        assert!(signatures.completion_shapes()["reader"].is_some());
+        assert!(signatures.cache_bytes() > 0);
+        let changed = signatures.with_literal_sources([(extra, &added)]);
+        assert!(changed.completion_shapes()["reader"].is_none());
+        let owned = changed.into_owned();
+        assert!(owned.completion_shapes()["reader"].is_none());
+    }
+
+    #[test]
     fn common_grammars_cannot_certify_unverified_external_declarations() {
         let source = r"\newcommand\one[1]{#1}\renewcommand\one[1]{#1}\def\bridge{\one}\bridge{Text}\ref{same}";
         let parsed = syntax::Syntax::latex(&Text::new(source.into()));

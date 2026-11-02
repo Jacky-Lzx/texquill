@@ -1695,11 +1695,19 @@ pub(crate) fn unproved_citation_completion(ws: &Workspace, uri: &Url, offset: us
 pub(crate) struct Project<'a> {
     pub root: Url,
     pub docs: Vec<(Url, &'a Document)>,
-    pub signatures: CommandSignatures<'a>,
+    pub signatures: Arc<CommandSignatures<'a>>,
 }
 pub(crate) fn section_projects<'a>(
     ws: &'a Workspace,
     uri: &Url,
+) -> Option<(bool, Vec<Project<'a>>)> {
+    section_projects_for_cursor(ws, uri, None)
+}
+
+fn section_projects_for_cursor<'a>(
+    ws: &'a Workspace,
+    uri: &Url,
+    cursor: Option<usize>,
 ) -> Option<(bool, Vec<Project<'a>>)> {
     let mut roots: BTreeSet<_> = ws.source_roots(uri).into_iter().collect();
     // Opened roots consume shared files even before their own path is saved.
@@ -1716,7 +1724,6 @@ pub(crate) fn section_projects<'a>(
         }
     }
     let mut projects = Vec::new();
-    let mut selected = false;
     let mut bytes = 0usize;
     for root in roots {
         let mut scope = ws.project_documents(&root);
@@ -1750,27 +1757,38 @@ pub(crate) fn section_projects<'a>(
         if bytes > 16 * 1024 * 1024 {
             return None;
         }
-        let signatures = CommandSignatures::new(
-            docs.iter()
-                .map(|(_, doc)| (doc.text.source.as_str(), &doc.syntax)),
-        );
-        selected |= crate::bibliography::bib_sections::selects_resources(
-            &docs.iter().map(|(_, doc)| *doc).collect::<Vec<_>>(),
-            &signatures,
-        );
-        // BBL execution can inject source sets even without a TeX declaration
-        // or explicit resource section. Own those keys before generic fallback.
-        selected |= modern_databases(&docs, &signatures)
-            && scope
-                .iter()
-                .filter_map(|uri| ws.documents.get(uri))
-                .any(database_execution);
+        let signatures = crate::symbols::query_cache::project_signatures(ws, &scope);
         projects.push(Project {
             root,
             docs,
             signatures,
         });
     }
+    // Completion first proves that this cursor can name a source-set key.
+    // Ordinary file/command queries must not trace bibliography execution in
+    // every project merely because a class contains csname declarations.
+    if cursor.is_some_and(|offset| {
+        ws.documents.get(uri).is_none_or(|doc| {
+            !projects
+                .iter()
+                .any(|project| source_completion_candidate(doc, &project.signatures, offset))
+        })
+    }) {
+        return Some((false, Vec::new()));
+    }
+    let selected = projects.iter().any(|project| {
+        let docs = &project.docs;
+        let signatures = &project.signatures;
+        crate::bibliography::bib_sections::selects_resources(
+            &docs.iter().map(|(_, doc)| *doc).collect::<Vec<_>>(),
+            signatures,
+        ) || modern_databases(docs, signatures)
+            && ws
+                .project_documents(&project.root)
+                .iter()
+                .filter_map(|uri| ws.documents.get(uri))
+                .any(database_execution)
+    });
     Some((selected, projects))
 }
 
@@ -1781,6 +1799,22 @@ pub(crate) fn source_projects<'a>(
     ws: &'a Workspace,
     uri: &Url,
 ) -> Option<(bool, Vec<Project<'a>>)> {
+    source_projects_for_cursor(ws, uri, None)
+}
+
+pub(crate) fn source_completion_projects<'a>(
+    ws: &'a Workspace,
+    uri: &Url,
+    offset: usize,
+) -> Option<(bool, Vec<Project<'a>>)> {
+    source_projects_for_cursor(ws, uri, Some(offset))
+}
+
+fn source_projects_for_cursor<'a>(
+    ws: &'a Workspace,
+    uri: &Url,
+    cursor: Option<usize>,
+) -> Option<(bool, Vec<Project<'a>>)> {
     // This document necessarily belongs to its own context. Reject a locally
     // exhausted budget before constructing its consumer scopes and signatures.
     if ws.documents.get(uri).is_some_and(|doc| {
@@ -1790,7 +1824,7 @@ pub(crate) fn source_projects<'a>(
     }) {
         return None;
     }
-    let (selected, projects) = section_projects(ws, uri)?;
+    let (selected, projects) = section_projects_for_cursor(ws, uri, cursor)?;
     let sources = !selected
         && projects.iter().any(|project| {
             ws.is_root(&project.root)
@@ -2946,4 +2980,41 @@ fn static_databases(ws: &Workspace, root: &Url) -> bool {
         }
     }
     true
+}
+
+#[cfg(test)]
+mod completion_project_tests {
+    use super::*;
+
+    #[test]
+    fn completion_skips_unrelated_source_traces_and_keeps_named_citation_keys() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().canonicalize().unwrap().join("main.tex");
+        let uri = Url::from_file_path(&path).unwrap();
+        let source = "\\def\\citer{\\cite}\n\\defbibentryset{chosen}{member}\n\\begin{document}\n\\input{Tex/}\n\\csuse{cite}{cho}\n\\end{document}\n";
+        let mut ws = Workspace::default();
+        ws.config.distribution.enabled = false;
+        std::fs::write(path, source).unwrap();
+        ws.open(uri.clone(), source.into(), 1);
+        crate::analysis::AnalysisContext::new().run(|_| {
+            let path = source.find("Tex/").unwrap() + 4;
+            let (selected, projects) = source_completion_projects(&ws, &uri, path).unwrap();
+            assert!(!selected);
+            assert!(
+                projects.is_empty(),
+                "file queries entered bibliography traces"
+            );
+            let citation = source.find("{cho}").unwrap() + 4;
+            let (selected, projects) = source_completion_projects(&ws, &uri, citation).unwrap();
+            assert!(!projects.is_empty());
+            let (ordinary_selected, ordinary_projects) = source_projects(&ws, &uri).unwrap();
+            assert_eq!(selected, ordinary_selected);
+            assert_eq!(projects.len(), ordinary_projects.len());
+            assert!(projects.iter().all(|project| source_completion_candidate(
+                &ws.documents[&uri],
+                &project.signatures,
+                citation
+            )));
+        });
+    }
 }

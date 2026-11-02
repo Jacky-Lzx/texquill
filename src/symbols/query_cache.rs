@@ -163,7 +163,18 @@ pub(crate) fn source_signatures(
         &context,
         (workspace as *const Workspace as usize, scope.clone()),
         |cache| &mut cache.source_signatures,
-        || build().into_owned(),
+        || {
+            let preliminary = project_signatures(workspace, scope);
+            CommandSignatures::source_context_with(
+                scope
+                    .iter()
+                    .filter_map(|uri| workspace.documents.get(uri))
+                    .filter(|doc| doc.kind == DocumentKind::Latex)
+                    .map(|doc| (doc.text.source.as_str(), &doc.syntax)),
+                &preliminary,
+            )
+            .into_owned()
+        },
         |signatures| signatures.cache_bytes().saturating_add(key_bytes),
     )
 }
@@ -259,6 +270,31 @@ mod tests {
             }))
             .into_owned()
         })
+    }
+
+    #[test]
+    fn source_filtering_reuses_editing_grammar_without_inheriting_deferred_meanings() {
+        let uri = Url::parse("untitled:filtered-grammar.tex").unwrap();
+        let source = r"\def\install{\def\reader#1{#1}}\def\forward{\input}\input{live}";
+        let mut workspace = Workspace::default();
+        document(&mut workspace, &uri, source);
+        let scope = BTreeSet::from([uri.clone()]);
+        with_cache(|| {
+            let raw = super::project_signatures(&workspace, &scope);
+            assert!(!raw.command_unchanged("reader"));
+            let filtered = source_signatures(&workspace, &scope);
+            assert!(filtered.command_unchanged("reader"));
+            assert!(Arc::ptr_eq(
+                &raw,
+                &super::project_signatures(&workspace, &scope)
+            ));
+            let doc = &workspace.documents[&uri];
+            let independent = CommandSignatures::source_context([(source, &doc.syntax)]);
+            assert_eq!(
+                filtered.source_command_positions(source, &doc.syntax),
+                independent.source_command_positions(source, &doc.syntax)
+            );
+        });
     }
 
     #[test]

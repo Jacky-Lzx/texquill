@@ -104,11 +104,22 @@ impl Prepared {
                 .filter(|doc| doc.kind == DocumentKind::Latex)
                 .map(|doc| (doc.text.source.as_str(), &doc.syntax)),
         );
-        let grammar_bytes = signatures.cache_bytes().saturating_mul(2);
+        let shapes = signatures.completion_shapes();
+        // Retain the projected parameter readers, not the query grammar or
+        // its memoized intermediate tables. Charge only storage kept here.
+        let mut grammar_bytes = shapes
+            .iter()
+            .map(|(name, shape)| {
+                name.capacity()
+                    + 3 * std::mem::size_of::<(String, Option<CommandShape>)>()
+                    + 128
+                    + shape.as_ref().map_or(0, CommandShape::cache_bytes)
+            })
+            .sum::<usize>()
+            + 11 * std::mem::size_of::<(String, Option<CommandShape>)>();
         if grammar_bytes >= MAX_ENTRY_BYTES {
             return None;
         }
-        let shapes = signatures.completion_shapes();
         let declared: BTreeSet<_> = ws
             .documents
             .values()
@@ -199,6 +210,14 @@ impl Prepared {
                     inert.insert(prefix.to_owned());
                 }
             }
+        }
+        grammar_bytes += inert
+            .iter()
+            .map(|name| name.capacity() + 3 * std::mem::size_of::<String>() + 128)
+            .sum::<usize>()
+            + 11 * std::mem::size_of::<String>();
+        if grammar_bytes >= MAX_ENTRY_BYTES {
+            return None;
         }
         let key = canonical(doc, &shapes, &inert)?;
         let mut templates = ws.clone();
@@ -667,6 +686,45 @@ mod tests {
             serde_json::to_value(items).unwrap(),
             serde_json::to_value(features::completion(&ws, &uri, position)).unwrap()
         );
+    }
+
+    #[test]
+    fn large_classes_charge_only_the_grammars_retained_by_the_candidate_pool() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let source = "\\documentclass{sample}\n\\begin{document}\n\\inp\n\\end{document}\n";
+        let mut class = String::new();
+        for index in 0..1000 {
+            let suffix: String = [index / 676, index / 26 % 26, index % 26]
+                .into_iter()
+                .map(|digit| (b'a' + digit as u8) as char)
+                .collect();
+            class.push_str(&format!("\\newcommand{{\\classmacro{suffix}}}{{Text}}\n"));
+        }
+        std::fs::write(root.join("main.tex"), source).unwrap();
+        std::fs::write(root.join("sample.cls"), class).unwrap();
+        let uri = Url::from_file_path(root.join("main.tex")).unwrap();
+        let mut ws = Workspace::default();
+        ws.config.distribution.enabled = false;
+        ws.open(uri.clone(), source.into(), 1);
+        assert_eq!(
+            ws.documents
+                .values()
+                .map(|doc| doc.syntax.definitions.len())
+                .sum::<usize>(),
+            1000
+        );
+        let prepared =
+            Prepared::build(&ws, &uri, 0).expect("temporary query tables consumed pool budget");
+        assert!(prepared.bytes <= MAX_ENTRY_BYTES);
+        let position = ws.documents[&uri]
+            .text
+            .position(source.find("\\inp\n").unwrap() + 4);
+        assert!(prepared
+            .complete(&ws, position)
+            .unwrap()
+            .iter()
+            .any(|item| item.label == "input"));
     }
     #[test]
     fn structural_edits_metadata_changes_and_argument_contexts_invalidate_preparation() {

@@ -23,7 +23,7 @@ fn context(ws: &Workspace, uri: &Url, offset: usize) -> Option<Option<Context>> 
     }) {
         return None;
     }
-    let (selected, projects) = match bib_section_keys::source_projects(ws, uri) {
+    let (selected, projects) = match bib_section_keys::source_completion_projects(ws, uri, offset) {
         Some(projects) => projects,
         None if bib_section_keys::unproved_citation_completion(ws, uri, offset) => {
             return Some(None)

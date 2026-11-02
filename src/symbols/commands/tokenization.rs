@@ -142,6 +142,7 @@ impl InlineTokenization {
             let mut signatures = CommandSignatures::source_context([(source, parsed)]);
             signatures.inline_copy_operands(parsed);
             self.signatures = Some(CommandSignatures {
+                common_grammars: Default::default(),
                 local: signatures
                     .local
                     .into_iter()
