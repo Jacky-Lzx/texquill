@@ -287,7 +287,7 @@ impl Prepared {
             .find('\n')
             .map_or(doc.text.source.len(), |at| offset + at);
         let line = &doc.text.source[start..line_end];
-        let slash = start + line.len() - line.trim_start_matches([' ', '\t']).len();
+        let slash = start + inert_command(line, &self.inputs.inert)?;
         if doc.text.source.as_bytes().get(slash) != Some(&b'\\') || offset <= slash {
             return None;
         }
@@ -374,9 +374,22 @@ fn signatures_bytes(signatures: &BTreeMap<String, Option<Signature>>) -> usize {
         .sum()
 }
 
-/// Only whole, ungrouped prose/comment lines and inert command spellings may
-/// vary. Parameter readers, declarations, literal regions and doc comments are
-/// retained verbatim. Incomplete confirmed readers protect the remaining source.
+fn prose(value: &str) -> bool {
+    !value.contains(['\\', '{', '}', '$', '#', '&', '^', '~', '%'])
+}
+
+/// Ordinary text before a partial command changes no TeX structure. Keeping the
+/// whole line check shared with canonicalization also rejects additional commands,
+/// groups, comments, math delimiters and trailing arguments on that line.
+fn inert_command(line: &str, inert: &BTreeSet<String>) -> Option<usize> {
+    let slash = line.find('\\')?;
+    (prose(&line[..slash]) && inert.contains(line[slash + 1..].trim_end())).then_some(slash)
+}
+
+/// Only whole, ungrouped prose/comment lines and inert command spellings (with
+/// optional prose before them) may vary. Parameter readers, declarations, literal
+/// regions and doc comments are retained verbatim. Incomplete confirmed readers
+/// protect the remaining source.
 fn canonical(
     doc: &Document,
     shapes: &BTreeMap<String, Option<CommandShape>>,
@@ -468,11 +481,8 @@ fn canonical_context(
                 .comments
                 .iter()
                 .any(|span| start <= span.start && span.start < end);
-        let prose = !value.contains(['\\', '{', '}', '$', '#', '&', '^', '~', '%']);
-        let command = value
-            .strip_prefix('\\')
-            .is_some_and(|name| inert.contains(name));
-        let retained = blocked || !(comment || prose || command);
+        let command = inert_command(line, inert).is_some();
+        let retained = blocked || !(comment || prose(value) || command);
         if retained
             && cursor.is_some_and(|offset| {
                 start <= offset && (offset < end || offset == end && !line.ends_with('\n'))
@@ -577,6 +587,87 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn inline_prose_edits_and_cursor_moves_match_contextual_completion() {
+        for math in [false, true] {
+            for snippets in [false, true] {
+                let (mut ws, uri, source) = fixture();
+                ws.client.snippets = snippets;
+                let source = if math {
+                    source.replace("Ready", "$\nReady\n$")
+                } else {
+                    source
+                };
+                ws.documents
+                    .insert(uri.clone(), Document::new(&uri, source.clone(), Some(1)));
+                let mut cache = Cache::default();
+                cache.insert(Prepared::build(&ws, &uri, 0).unwrap());
+                for (index, command) in ["\\inp", "\\proj", "\\al"].into_iter().enumerate() {
+                    let current = source
+                        .replace("Ready", &format!("  连续输入 😀 ordinary text {command}  "));
+                    ws.documents.insert(
+                        uri.clone(),
+                        Document::new(&uri, current.clone(), Some(index as i32 + 2)),
+                    );
+                    let slash = current.rfind(command).unwrap();
+                    // The edit must replace the whole command even when the
+                    // cursor has moved back into it; positions use UTF-16.
+                    // Broad `\p` also matches verbatim providers, which retain
+                    // their existing contextual fallback.
+                    let first = if command == "\\proj" { 3 } else { 2 };
+                    for cursor in first..=command.len() {
+                        let position = ws.documents[&uri].text.position(slash + cursor);
+                        let items = cache.complete(&ws, 0, &uri, position).unwrap_or_else(|| {
+                            panic!("inline {command:?}, cursor={cursor}, math={math}")
+                        });
+                        assert_eq!(
+                            serde_json::to_value(items).unwrap(),
+                            serde_json::to_value(features::completion(&ws, &uri, position))
+                                .unwrap(),
+                            "{command}, cursor={cursor}, math={math}, snippets={snippets}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn inline_prose_after_a_class_disables_maketitle_reuses_candidates() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let (_, _, source) = fixture();
+        let source = source
+            .replace("{article}", "{sample}")
+            .replace("Ready", "\\maketitle\nReady");
+        std::fs::write(root.join("main.tex"), &source).unwrap();
+        std::fs::write(
+            root.join("sample.cls"),
+            "\\def\\maketitle{Title text}\\let\\maketitle\\relax\n",
+        )
+        .unwrap();
+        let uri = Url::from_file_path(root.join("main.tex")).unwrap();
+        let mut ws = Workspace::default();
+        ws.config.distribution.enabled = false;
+        ws.open(uri.clone(), source.clone(), 1);
+        assert!(ws
+            .documents
+            .contains_key(&Url::from_file_path(root.join("sample.cls")).unwrap()));
+        let mut cache = Cache::default();
+        cache.insert(Prepared::build(&ws, &uri, 0).unwrap());
+        let current = source.replace("Ready", "% typing\n正文 😀 text \\inp");
+        let position =
+            crate::text::Text::new(current.clone()).position(current.find("\\inp\n").unwrap() + 4);
+        ws.documents
+            .insert(uri.clone(), Document::new(&uri, current, Some(2)));
+        let items = cache.complete(&ws, 0, &uri, position).unwrap();
+        assert!(items.iter().any(|item| item.label == "input"));
+        assert_eq!(
+            serde_json::to_value(items).unwrap(),
+            serde_json::to_value(features::completion(&ws, &uri, position)).unwrap()
+        );
+    }
     #[test]
     fn structural_edits_metadata_changes_and_argument_contexts_invalidate_preparation() {
         let (mut ws, uri, source) = fixture();
@@ -590,6 +681,11 @@ mod tests {
             source.replace("Ready", r"\section{\inp}"),
             source.replace("Ready", r"\verb|\inp|"),
             source.replace("Ready", r"\input{\inp}"),
+            source.replace("Ready", r"Text $ \inp"),
+            source.replace("Ready", r"Text {\inp}"),
+            source.replace("Ready", r"Text \input{new}"),
+            source.replace("Ready", r"Text \inp followed by text"),
+            source.replace("Ready", r"Text \unknown \inp"),
             source.replace("Ready", "% !TeX root = other.tex"),
         ] {
             ws.documents
@@ -606,6 +702,30 @@ mod tests {
             Document::new(&other, r"\newcommand{\added}{}".into(), Some(1)),
         );
         assert!(!cache.covers(&ws, 0, &uri));
+    }
+
+    #[test]
+    fn inline_commands_in_protected_lines_still_require_contextual_completion() {
+        let (mut ws, uri, source) = fixture();
+        for content in [
+            "\\projectmacro\ntext \\inp\nsecond",
+            "\\section{\ntext \\inp\n}",
+            "\\input{\ntext \\inp\n}",
+        ] {
+            let current = source.replace("Ready", content);
+            let position = crate::text::Text::new(current.clone())
+                .position(current.find("\\inp\n").unwrap() + "\\inp".len());
+            ws.documents
+                .insert(uri.clone(), Document::new(&uri, current, Some(2)));
+            let mut cache = Cache::default();
+            if let Some(prepared) = Prepared::build(&ws, &uri, 0) {
+                cache.insert(prepared);
+            }
+            assert!(
+                cache.complete(&ws, 0, &uri, position).is_none(),
+                "{content}"
+            );
+        }
     }
 
     #[test]

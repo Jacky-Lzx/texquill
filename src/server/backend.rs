@@ -1994,7 +1994,7 @@ mod read_query_tests {
             start.await.unwrap();
             finishes.push(finish);
         }
-        let current = source.replace("\\inp", "% moved 😀\n\\inp");
+        let current = source.replace("\\inp", "% moved\n正文 😀 text \\inp");
         backend
             .did_change(
                 serde_json::from_value(serde_json::json!({

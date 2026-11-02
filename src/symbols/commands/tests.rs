@@ -22,6 +22,36 @@ mod tex_operand_tests {
     }
 
     #[test]
+    fn completion_can_prove_zero_parameters_without_proving_a_unique_meaning() {
+        let source = r"\def\maketitle{Title text}\let\maketitle\relax";
+        let parsed = syntax::Syntax::latex(&Text::new(source.into()));
+        let signatures = CommandSignatures::new([(source, &parsed)]);
+        assert!(signatures.local["maketitle"].is_none());
+        assert!(signatures.completion_shapes()["maketitle"]
+            .as_ref()
+            .unwrap()
+            .takes_no_arguments());
+        let unverified =
+            CommandSignatures::with_ambiguous_names([(source, &parsed)], ["maketitle"]);
+        assert!(unverified.completion_shapes()["maketitle"].is_none());
+
+        for source in [
+            r"\def\maketitle#1{}\let\maketitle\relax",
+            r"\def\relax#1{}\def\maketitle{}\let\maketitle\relax",
+            r"\def\original{}\def\maketitle{}\let\maketitle\original\def\original#1{}",
+            r"\def\maketitle{}\let\maketitle\unknown",
+            r"\def\maketitle{}\let\maketitle\noexpand",
+        ] {
+            let parsed = syntax::Syntax::latex(&Text::new(source.into()));
+            let signatures = CommandSignatures::new([(source, &parsed)]);
+            assert!(
+                signatures.completion_shapes()["maketitle"].is_none(),
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
     fn copied_literal_candidates_capture_builtin_and_previous_source_shapes() {
         for (source, expected) in [
             (

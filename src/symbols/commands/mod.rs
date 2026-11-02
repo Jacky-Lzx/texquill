@@ -1777,6 +1777,29 @@ impl<'a> CommandSignatures<'a> {
                 (name.into_owned(), shape)
             })
             .collect();
+        // A class may disable a zero-argument command with `\let\name\relax`.
+        // The meaning is ambiguous, but every declaration still reads zero
+        // parameters. Certify only the completion boundary, never its meaning.
+        // Captured user definitions and overridden builtins remain unknown.
+        for (name, candidates) in &self.literal_operands {
+            if result.get(name.as_ref()).is_some_and(Option::is_none)
+                && !self.unverified_names.contains(name)
+                && !candidates.is_empty()
+                && candidates.iter().all(|candidate| match candidate {
+                    LiteralOperands::Signature(signature) => signature.parameters.is_empty(),
+                    LiteralOperands::Tex(tex) => tex.prefix.is_empty() && tex.delimiters.is_empty(),
+                    LiteralOperands::Alias(target) | LiteralOperands::Copy(target) => {
+                        target != "noexpand"
+                            && !self.local.contains_key(target.as_str())
+                            && operand_builtin(target)
+                                .is_some_and(|signature| signature.parameters.is_empty())
+                    }
+                    LiteralOperands::Unknown => false,
+                })
+            {
+                result.insert(name.to_string(), Some(CommandShape::no_arguments()));
+            }
+        }
         for name in COMMANDS
             .iter()
             .map(|entry| entry.0)
