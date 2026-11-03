@@ -119,6 +119,33 @@ timeline rather than relying on the overall median to find a brief stall.
 These are protocol measurements; candidate menu timing requires a separate
 Neovim check. Each case starts a new server; use multiple rounds for variability.
 
+## Save-triggered compilation in Neovim
+
+`benchmarks/save_build_ui.py` copies a real project and uses the user's Neovim
+configuration. It primes one manual build, then checks ordinary and repeated
+saves, rapid consecutive saves, and a save followed by more unsaved typing.
+For the paper layout it also saves the introduction independently and then
+immediately saves the main file. Short `\typeout` markers in the disposable
+sources verify which saved revision reached the actual compiler log; the
+unsaved marker must remain in the buffer and stay out of that log. File
+watchers and the configured compiler remain enabled.
+
+```sh
+python3 benchmarks/save_build_ui.py /path/to/beamer \
+  --server target/release/texquill --output target/performance/save-build-ui
+```
+
+Use `--cases main_changed` for the ordinary-save regression alone. The runner
+accepts a `main.tex` project and adds child-file cases when
+`Tex/1_Introduction.tex` exists.
+
+The save-queue repair passed 580 library tests and the focused watcher, rebuild
+and unchanged-save protocol suites. Real Neovim checks covered five Beamer and
+seven paper scenarios, including compiler-log markers and retained unsaved
+buffer text. An additional full protocol audit reported 423 passes and three
+input-cancellation failures (including the separately documented pull-diagnostic
+race); those failures are not counted as passes for this repair.
+
 ## Other command completion scenarios
 
 `benchmarks/completion_matrix.py` tests commands beyond `\input`: sectioning,

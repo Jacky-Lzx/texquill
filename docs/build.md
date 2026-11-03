@@ -27,6 +27,13 @@ merged only when their captured document revision is still current; they never
 replace a newer buffer edit. Preparing builds participate in cancellation,
 shutdown and rebuild queueing. Saves received during preparation are checked
 against the prepared inputs before deciding whether a follow-up is necessary.
+Passive watcher events arriving during preparation use these new snapshots,
+instead of cancelling the request against the previous compilation's inputs.
+If another save changes the source before preparation finishes, the newest
+saved revision retries preparation. Queued automatic builds retain that saved
+editor snapshot while later unsaved typing stays in the editor. Explicit
+cancellation still discards pending work, and queued manual rebuilds continue
+to use the latest configuration and editor state when they start.
 
 Completed builds also prepare dependency reloads, file checks and diagnostic
 locations in the background. Publication merges only that root's observations

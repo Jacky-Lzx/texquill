@@ -236,11 +236,12 @@ impl BuildManager {
                         || workspace.read().await.settings(&queued.uri).build.on_save)
                 {
                     if let Err(error) = manager
-                        .start_request(
+                        .start_saved_request(
                             queued.uri,
                             Some((root_uri, generation)),
                             queued.rebuild,
                             None,
+                            queued.saved,
                         )
                         .await
                     {

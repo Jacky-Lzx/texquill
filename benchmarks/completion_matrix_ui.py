@@ -17,11 +17,11 @@ from pathlib import Path
 from completion_matrix import CASES, fixture
 
 
-def run(args, mode):
+def run(args, mode, *, suite_cases=CASES, script=None, project_fixture=fixture):
     with tempfile.TemporaryDirectory(prefix="texquill-completion-ui-") as tmp:
         root = Path(tmp) / "project"
-        sources = fixture(args.project, root)
-        cases = [c for c in CASES if not args.cases or c["name"] in args.cases]
+        sources = project_fixture(args.project, root)
+        cases = [c for c in suite_cases if not args.cases or c["name"] in args.cases]
         manifest = Path(tmp) / "manifest.json"
         manifest.write_text(
             json.dumps(
@@ -54,7 +54,7 @@ def run(args, mode):
             env["MATRIX_NO_CHKTEX"] = "1"
         if args.raw_backslash:
             env["MATRIX_RAW_BACKSLASH"] = "1"
-        script = Path(__file__).with_suffix(".lua").resolve()
+        script = (script or Path(__file__).with_suffix(".lua")).resolve()
         process = subprocess.Popen(
             [
                 args.nvim,

@@ -45,7 +45,7 @@ struct Record {
     rebuild: bool,
     preparing: bool,
     // Saves and passive file events recheck the new inputs after preparation.
-    preparing_saved: Option<Url>,
+    preparing_saved: Option<QueuedBuild>,
     cancel_generation: u64,
     inputs: BTreeMap<Url, InputSnapshot>,
     configuration: Option<Value>,
@@ -71,6 +71,20 @@ fn artifact_binding(path: PathBuf) -> PathBuf {
 }
 
 impl Record {
+    fn saved_inputs_changed(
+        &self,
+        workspace: &crate::project::workspace::Workspace,
+        root: &Url,
+        uri: &Url,
+    ) -> bool {
+        !self.inputs.contains_key(uri)
+            || self.inputs.iter().any(|(uri, input)| input.changed(uri))
+            || self.checks.changed_path().is_some()
+            || self.checks.image_changed(|_| true)
+            || self.configuration.as_ref()
+                != Some(&serde_json::to_value(workspace.build_config(root).unresolved()).unwrap())
+    }
+
     fn current_artifact(&self, path: &Path) -> Option<PathBuf> {
         Some(
             self.output_directory
@@ -102,9 +116,39 @@ impl Record {
     }
 }
 
+#[derive(Clone)]
+struct SavedInputs {
+    order: u64,
+    documents: crate::project::documents::Documents,
+}
+
+impl SavedInputs {
+    fn capture(workspace: &crate::project::workspace::Workspace, order: u64) -> Self {
+        let mut documents = workspace.documents.clone();
+        documents.retain(|_, doc| doc.version.is_some());
+        Self { order, documents }
+    }
+}
+
 struct QueuedBuild {
     uri: Url,
     rebuild: bool,
+    saved: Option<SavedInputs>,
+}
+
+fn remember_queued(slot: &mut Option<QueuedBuild>, mut next: QueuedBuild) {
+    if let Some(previous) = slot.take() {
+        next.rebuild |= previous.rebuild;
+        if previous
+            .saved
+            .as_ref()
+            .is_some_and(|old| next.saved.as_ref().is_none_or(|new| old.order > new.order))
+        {
+            next.uri = previous.uri;
+            next.saved = previous.saved;
+        }
+    }
+    *slot = Some(next);
 }
 
 pub(super) struct WatchedBuild {
@@ -119,6 +163,7 @@ pub struct BuildManager {
     workspace: WorkspaceStore,
     state: Arc<Mutex<BTreeMap<Url, Record>>>,
     sequence: Arc<AtomicU64>,
+    saves: Arc<AtomicU64>,
     idle: Arc<Notify>,
     closing: Arc<AtomicBool>,
     disconnected: Arc<AtomicBool>,
@@ -160,13 +205,12 @@ struct PreparationGuard {
     launched: bool,
 }
 
-impl Drop for PreparationGuard {
-    fn drop(&mut self) {
-        if self.launched {
-            return;
-        }
+impl PreparationGuard {
+    /// Retire under the caller's state lock so a newer save cannot be queued
+    /// between selecting a retry and clearing this failed preparation.
+    fn retire(&mut self, record: Option<&mut Record>) {
         self.cancel.store(true, Ordering::Relaxed);
-        if let Some(record) = self.manager.state.lock().unwrap().get_mut(&self.root) {
+        if let Some(record) = record {
             if record
                 .active
                 .as_ref()
@@ -178,8 +222,21 @@ impl Drop for PreparationGuard {
                 record.queued = None;
             }
         }
+        self.launched = true;
         self.manager.tasks.fetch_sub(1, Ordering::SeqCst);
         self.manager.idle.notify_waiters();
+    }
+}
+
+impl Drop for PreparationGuard {
+    fn drop(&mut self) {
+        if self.launched {
+            return;
+        }
+        let manager = self.manager.clone();
+        let mut state = manager.state.lock().unwrap();
+        let record = state.get_mut(&self.root);
+        self.retire(record);
     }
 }
 
@@ -190,6 +247,7 @@ impl BuildManager {
             workspace,
             state: Arc::default(),
             sequence: Arc::new(AtomicU64::new(1)),
+            saves: Arc::default(),
             idle: Arc::default(),
             closing: Arc::default(),
             disconnected: Arc::default(),
@@ -374,10 +432,29 @@ impl BuildManager {
         rebuild: bool,
         guard: Option<crate::editing::RebuildGuard>,
     ) -> Result<Value> {
-        // Capture the ordered editor state without propagating dependencies on
-        // the live workspace. The compiler reads saved bytes; subsequent edits
-        // are checked when results are published, not copied over this snapshot.
-        let workspace = self.workspace.read_unindexed().await.clone();
+        self.start_saved_request(uri, queued_generation, rebuild, guard, None)
+            .await
+    }
+
+    async fn start_saved_request(
+        &self,
+        uri: Url,
+        queued_generation: Option<(Url, u64)>,
+        rebuild: bool,
+        guard: Option<crate::editing::RebuildGuard>,
+        saved: Option<SavedInputs>,
+    ) -> Result<Value> {
+        // A queued save owns the editor revision at that save, even if further
+        // unsaved typing arrives before its compiler can start.
+        let (mut workspace, order) = {
+            let workspace = self.workspace.read_unindexed().await;
+            (workspace.clone(), self.saves.load(Ordering::SeqCst))
+        };
+        let saved_request = saved.is_some();
+        let saved = saved.unwrap_or_else(|| SavedInputs::capture(&workspace, order));
+        workspace
+            .pending_dependencies
+            .extend(workspace.documents.overlay_open(&saved.documents));
         let root = workspace
             .root_document(&uri)
             .map_err(Error::invalid_params)?;
@@ -412,9 +489,32 @@ impl BuildManager {
                 return Ok(json!({"status":"cancelled", "rootUri":root}));
             }
             let record = state.entry(root.clone()).or_default();
-            if let Some((id, _)) = &record.active {
+            if let Some((id, active_cancel)) = &record.active {
+                if saved_request && !active_cancel.load(Ordering::Relaxed) {
+                    let pending = QueuedBuild {
+                        uri: uri.clone(),
+                        rebuild: false,
+                        saved: Some(saved.clone()),
+                    };
+                    if record.preparing {
+                        remember_queued(&mut record.preparing_saved, pending);
+                    } else if record.saved_inputs_changed(&workspace, &root, &uri) {
+                        remember_queued(&mut record.queued, pending);
+                    }
+                }
                 if rebuild && (queued_generation.is_none() || !record.rebuild) {
-                    record.queued = Some(QueuedBuild { uri, rebuild: true });
+                    let request = QueuedBuild {
+                        uri,
+                        rebuild: true,
+                        saved: saved_request.then(|| saved.clone()),
+                    };
+                    if saved_request {
+                        remember_queued(&mut record.queued, request);
+                    } else {
+                        // An explicit rebuild keeps its existing policy of
+                        // reading the newest editor state when it can start.
+                        record.queued = Some(request);
+                    }
                 }
                 return Ok(json!({"status":"running", "buildId":id, "rootUri":root,
                     "queued":record.queued.is_some(), "rebuild":record.rebuild,
@@ -448,7 +548,7 @@ impl BuildManager {
             tasks: self.tasks.clone(),
             idle: self.idle.clone(),
         };
-        let mut input = tokio::task::spawn_blocking(move || {
+        let prepared = tokio::task::spawn_blocking(move || {
             let _task = worker_task;
             preparation::prepare(
                 workspace,
@@ -459,14 +559,58 @@ impl BuildManager {
             )
         })
         .await
-        .map_err(|error| Error::invalid_params(error.to_string()))??;
+        .map_err(|error| Error::invalid_params(error.to_string()))?;
+        let mut input = match prepared {
+            Ok(input) => input,
+            Err(error) => {
+                let retry = {
+                    let mut state = self.state.lock().unwrap();
+                    let record = state.get_mut(&root).unwrap();
+                    let retry = if record
+                        .active
+                        .as_ref()
+                        .is_some_and(|(id, _)| *id == build_id)
+                        && !cancel.load(Ordering::Relaxed)
+                        && record
+                            .preparing_saved
+                            .as_ref()
+                            .and_then(|request| request.saved.as_ref())
+                            .is_some_and(|latest| latest.order > saved.order)
+                    {
+                        let mut latest = record.preparing_saved.take().unwrap();
+                        latest.rebuild |= record.rebuild
+                            || record.queued.as_ref().is_some_and(|queued| queued.rebuild);
+                        Some((latest, record.cancel_generation))
+                    } else {
+                        None
+                    };
+                    preparation.retire(Some(record));
+                    retry
+                };
+                if let Some((latest, generation)) = retry {
+                    drop(preparation);
+                    return Box::pin(self.start_saved_request(
+                        latest.uri,
+                        Some((root, generation)),
+                        latest.rebuild,
+                        None,
+                        latest.saved,
+                    ))
+                    .await;
+                }
+                return Err(error);
+            }
+        };
         // Root/config changes can invalidate a pending launch. Ordinary typing
         // may proceed: the build retains its original saved-input snapshots.
         if !input.prepared_documents.is_empty() {
             let mut current = self.workspace.write_prepared().await;
-            current
-                .documents
-                .apply_updates(std::mem::take(&mut input.prepared_documents));
+            let scope = saved.documents.keys().cloned().collect();
+            if saved.documents.same_sources_for(&current.documents, &scope) {
+                current
+                    .documents
+                    .apply_updates(std::mem::take(&mut input.prepared_documents));
+            }
         }
         let current = self.workspace.read_unindexed().await.clone();
         let expected = serde_json::to_value(input.config.unresolved()).unwrap();
@@ -578,7 +722,7 @@ impl BuildManager {
                         .map(|path| crate::project::workspace::normalize_path(&path))
                 });
         }
-        let saved = self
+        let deferred = self
             .state
             .lock()
             .unwrap()
@@ -586,15 +730,22 @@ impl BuildManager {
             .and_then(|record| record.preparing_saved.take());
         self.launch(input, build_id, cancel);
         preparation.launched = true;
-        if let Some(uri) = saved {
-            Box::pin(self.on_save(uri)).await?;
+        if let Some(request) = deferred {
+            Box::pin(self.on_save_with_inputs(request.uri, request.saved.or(Some(saved)))).await?;
         }
         Ok(json!({"status":"started", "buildId":build_id, "rootUri":root, "rebuild":rebuild}))
     }
 
     /// Queue changed saved inputs once; identical saves reuse the active build.
     pub async fn on_save(&self, uri: Url) -> Result<()> {
+        self.on_save_with_inputs(uri, None).await
+    }
+
+    async fn on_save_with_inputs(&self, uri: Url, saved: Option<SavedInputs>) -> Result<()> {
         let workspace = self.workspace.read_unindexed().await;
+        let saved = saved.unwrap_or_else(|| {
+            SavedInputs::capture(&workspace, self.saves.fetch_add(1, Ordering::SeqCst) + 1)
+        });
         let root = workspace
             .root_document(&uri)
             .map_err(Error::invalid_params)?;
@@ -603,33 +754,39 @@ impl BuildManager {
             if let Some(record) = state.get_mut(&root) {
                 if let Some((_, cancel)) = &record.active {
                     if record.preparing {
-                        record.preparing_saved = Some(uri);
+                        remember_queued(
+                            &mut record.preparing_saved,
+                            QueuedBuild {
+                                uri,
+                                rebuild: false,
+                                saved: Some(saved),
+                            },
+                        );
                         return Ok(());
                     }
                     if !cancel.load(Ordering::Relaxed)
                         // Compare compiler input bytes, not editor versions or
                         // modification times, which can change on a plain save.
-                        && (!record.inputs.contains_key(&uri)
-                            || record.inputs.iter().any(|(uri, input)| input.changed(uri))
-                            || record.checks.changed_path().is_some()
-                            || record.checks.image_changed(|_| true)
-                            || record.configuration.as_ref()
-                                != Some(
-                                    &serde_json::to_value(
-                                        workspace.build_config(&root).unresolved(),
-                                    )
-                                    .unwrap(),
-                                ))
+                        && record.saved_inputs_changed(&workspace, &root, &uri)
                     {
                         let rebuild = record.queued.as_ref().is_some_and(|queued| queued.rebuild);
-                        record.queued = Some(QueuedBuild { uri, rebuild });
+                        remember_queued(
+                            &mut record.queued,
+                            QueuedBuild {
+                                uri,
+                                rebuild,
+                                saved: Some(saved),
+                            },
+                        );
                     }
                     return Ok(());
                 }
             }
         }
         drop(workspace);
-        self.start(uri).await.map(|_| ())
+        self.start_saved_request(uri, None, false, None, Some(saved))
+            .await
+            .map(|_| ())
     }
 
     pub fn cancel(&self, root: Option<&Url>) -> usize {
@@ -742,7 +899,13 @@ impl BuildManager {
                         .on_save)
             {
                 if let Err(error) = self
-                    .start_request(queued.uri, Some((root, generation)), queued.rebuild, None)
+                    .start_saved_request(
+                        queued.uri,
+                        Some((root, generation)),
+                        queued.rebuild,
+                        None,
+                        queued.saved,
+                    )
                     .await
                 {
                     self.client
@@ -770,7 +933,11 @@ impl BuildManager {
                     // These checks still describe the previous compilation.
                     // A delayed save notification must not cancel a new run
                     // before its own input snapshots have been installed.
-                    record.preparing_saved.get_or_insert_with(|| root.clone());
+                    record.preparing_saved.get_or_insert_with(|| QueuedBuild {
+                        uri: root.clone(),
+                        rebuild: false,
+                        saved: None,
+                    });
                     continue;
                 }
                 // TeX may rewrite a database itself (e.g. filecontents).
@@ -817,6 +984,7 @@ impl BuildManager {
                             queued: queued.unwrap_or_else(|| QueuedBuild {
                                 uri: root.clone(),
                                 rebuild: false,
+                                saved: None,
                             }),
                             generation: record.cancel_generation,
                         });
@@ -1036,6 +1204,276 @@ printf 'INPUT main.tex\n' > "$out/main.fls"
         assert!(manager.state.lock().unwrap()[&uri].queued.is_none());
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(unix)]
+    async fn changed_saves_retry_preparation_with_saved_text_and_preserve_unsaved_typing() {
+        for (rebuild, queued_force) in [(false, false), (true, false), (false, true)] {
+            let (manager, directory, uri, source) = gated_preparation();
+            manager.workspace.write().await.config.build.on_save = true;
+            let worker = manager.clone();
+            let main = uri.clone();
+            let pending = tokio::spawn(async move {
+                if rebuild {
+                    worker.rebuild(main).await.map(|_| ())
+                } else {
+                    worker.on_save(main).await
+                }
+            });
+            wait_preparing(directory.path()).await;
+            if queued_force {
+                assert_eq!(
+                    manager.rebuild(uri.clone()).await.unwrap()["queuedRebuild"],
+                    true
+                );
+            }
+            let saved = source.replace("missing", "saved-latest");
+            std::fs::write(uri.to_file_path().unwrap(), &saved).unwrap();
+            {
+                let mut workspace = manager.workspace.write_changes().await;
+                workspace.documents.insert(
+                    uri.clone(),
+                    crate::project::workspace::Document::new(&uri, saved.clone(), Some(2)),
+                );
+                workspace.defer_dependencies(uri.clone());
+            }
+            manager.on_save(uri.clone()).await.unwrap();
+            let unsaved = format!("{saved}% Continuing to type without saving\n");
+            {
+                let mut workspace = manager.workspace.write_changes().await;
+                workspace.documents.insert(
+                    uri.clone(),
+                    crate::project::workspace::Document::new(&uri, unsaved.clone(), Some(3)),
+                );
+                workspace.defer_dependencies(uri.clone());
+            }
+            std::fs::write(directory.path().join("release"), "").unwrap();
+            pending.await.unwrap().unwrap();
+            wait_build(&manager).await;
+            let result = manager.status(&uri);
+            assert_eq!(result["status"], "success", "{result}");
+            assert_eq!(result["rebuild"], rebuild || queued_force, "{result}");
+            assert_eq!(result["stale"], true, "{result}");
+            assert!(result["buildId"].as_u64().unwrap() > 1);
+            assert_eq!(
+                std::fs::read_to_string(uri.to_file_path().unwrap()).unwrap(),
+                saved
+            );
+            assert_eq!(
+                manager.workspace.read_unindexed().await.documents[&uri]
+                    .text
+                    .source,
+                unsaved
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(unix)]
+    async fn another_save_retries_changed_closed_inputs_without_an_editor_revision_change() {
+        let (manager, directory, uri, _) = gated_preparation();
+        let dependency = directory.path().join("missing.tex");
+        std::fs::write(&dependency, "Before").unwrap();
+        manager.workspace.write().await.refresh_project(&uri);
+        let worker = manager.clone();
+        let main = uri.clone();
+        let pending = tokio::spawn(async move { worker.on_save(main).await });
+        wait_preparing(directory.path()).await;
+        let revision = manager.workspace.source_revision();
+        std::fs::write(&dependency, "After").unwrap();
+        manager.on_save(uri.clone()).await.unwrap();
+        assert_eq!(manager.workspace.source_revision(), revision);
+        std::fs::write(directory.path().join("release"), "").unwrap();
+        pending.await.unwrap().unwrap();
+        wait_build(&manager).await;
+        assert_eq!(manager.status(&uri)["status"], "success");
+        assert_eq!(manager.status(&uri)["stale"], false);
+        assert!(manager.status(&uri)["buildId"].as_u64().unwrap() > 1);
+        assert_eq!(
+            manager.workspace.read_unindexed().await.documents
+                [&Url::from_file_path(dependency).unwrap()]
+                .text
+                .source,
+            "After"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(unix)]
+    async fn queued_saves_compile_saved_revisions_after_further_unsaved_edits() {
+        let (manager, directory, uri, source) = gated_preparation();
+        manager.workspace.write().await.config.build.on_save = true;
+        let script = directory.path().join("latexmk");
+        let compiler = std::fs::read_to_string(&script).unwrap().replace(
+            "touch compiled\n",
+            "touch compiled\nwhile [ ! -e finish-compile ]; do sleep 0.01; done\n",
+        );
+        std::fs::write(&script, compiler).unwrap();
+        let worker = manager.clone();
+        let main = uri.clone();
+        let pending = tokio::spawn(async move { worker.start(main).await });
+        wait_preparing(directory.path()).await;
+        std::fs::write(directory.path().join("release"), "").unwrap();
+        let first = pending.await.unwrap().unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !directory.path().join("compiled").exists() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let saved = source.replace("missing", "saved-followup");
+        std::fs::write(uri.to_file_path().unwrap(), &saved).unwrap();
+        {
+            let mut workspace = manager.workspace.write_changes().await;
+            workspace.documents.insert(
+                uri.clone(),
+                crate::project::workspace::Document::new(&uri, saved.clone(), Some(2)),
+            );
+            workspace.defer_dependencies(uri.clone());
+        }
+        manager.on_save(uri.clone()).await.unwrap();
+        let older = {
+            let workspace = manager.workspace.read_unindexed().await;
+            SavedInputs::capture(&workspace, manager.saves.load(Ordering::SeqCst))
+        };
+        let saved = saved.replace("saved-followup", "newest-followup");
+        std::fs::write(uri.to_file_path().unwrap(), &saved).unwrap();
+        {
+            let mut workspace = manager.workspace.write_changes().await;
+            workspace.documents.insert(
+                uri.clone(),
+                crate::project::workspace::Document::new(&uri, saved.clone(), Some(3)),
+            );
+            workspace.defer_dependencies(uri.clone());
+        }
+        manager.on_save(uri.clone()).await.unwrap();
+        let generation = manager.state.lock().unwrap()[&uri].cancel_generation;
+        manager
+            .start_saved_request(
+                uri.clone(),
+                Some((uri.clone(), generation)),
+                false,
+                None,
+                Some(older),
+            )
+            .await
+            .unwrap();
+        let unsaved = format!("{saved}% More unsaved typing\n");
+        {
+            let mut workspace = manager.workspace.write_changes().await;
+            workspace.documents.insert(
+                uri.clone(),
+                crate::project::workspace::Document::new(&uri, unsaved.clone(), Some(4)),
+            );
+            workspace.defer_dependencies(uri.clone());
+        }
+        std::fs::write(directory.path().join("finish-compile"), "").unwrap();
+        wait_build(&manager).await;
+        let result = manager.status(&uri);
+        assert_eq!(result["status"], "success", "{result}");
+        assert!(result["buildId"].as_u64().unwrap() > first["buildId"].as_u64().unwrap());
+        assert_eq!(result["stale"], true);
+        assert_eq!(
+            manager.workspace.read_unindexed().await.documents[&uri]
+                .text
+                .source,
+            unsaved
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(unix)]
+    async fn explicit_cancel_during_preparation_does_not_retry_a_pending_save() {
+        let (manager, directory, uri, source) = gated_preparation();
+        let worker = manager.clone();
+        let main = uri.clone();
+        let pending = tokio::spawn(async move { worker.on_save(main).await });
+        wait_preparing(directory.path()).await;
+        let saved = source.replace("missing", "saved-before-cancel");
+        std::fs::write(uri.to_file_path().unwrap(), &saved).unwrap();
+        manager.workspace.write_changes().await.documents.insert(
+            uri.clone(),
+            crate::project::workspace::Document::new(&uri, saved, Some(2)),
+        );
+        manager.on_save(uri.clone()).await.unwrap();
+        assert_eq!(manager.cancel(Some(&uri)), 1);
+        assert!(pending.await.unwrap().is_err());
+        manager.shutdown().await;
+        assert!(!directory.path().join("compiled").exists());
+        assert_eq!(manager.tasks.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(unix)]
+    async fn saved_build_preparation_preserves_newer_cross_file_editor_grammar() {
+        let (manager, directory, uri, _) = gated_preparation();
+        let provider = uri.join("provider.tex").unwrap();
+        let child = uri.join("child.tex").unwrap();
+        let main = r"\documentclass{article}\input{provider}\input{child}";
+        let alias = r"\let\ifempty\ifstrempty";
+        for (uri, source) in [
+            (&uri, main),
+            (&provider, alias),
+            (&child, r"\ifempty{\label{hidden}}{}{}"),
+        ] {
+            std::fs::write(uri.to_file_path().unwrap(), source).unwrap();
+        }
+        let saved = {
+            let mut workspace = manager.workspace.write().await;
+            workspace.open(uri.clone(), main.into(), 1);
+            workspace.open(provider.clone(), alias.into(), 1);
+            assert!(workspace.documents[&child].syntax.labels.is_empty());
+            SavedInputs::capture(&workspace, manager.saves.load(Ordering::SeqCst))
+        };
+        let unsaved = r"\def\ifempty#1{#1}";
+        {
+            let mut workspace = manager.workspace.write_changes().await;
+            workspace.documents.insert(
+                provider.clone(),
+                crate::project::workspace::Document::new(&provider, unsaved.into(), Some(2)),
+            );
+            workspace.defer_dependencies(provider.clone());
+        }
+        assert!(manager.workspace.read().await.documents[&child]
+            .syntax
+            .labels
+            .iter()
+            .any(|label| label.name == "hidden"));
+        let script = directory.path().join("latexmk");
+        let compiler = std::fs::read_to_string(&script).unwrap().replace(
+            "touch compiled\n",
+            "touch compiled\nwhile [ ! -e finish-compile ]; do sleep 0.01; done\n",
+        );
+        std::fs::write(script, compiler).unwrap();
+        std::fs::write(directory.path().join("release"), "").unwrap();
+        manager
+            .start_saved_request(uri, None, false, None, Some(saved))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !directory.path().join("compiled").exists() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let preserved = {
+            let workspace = manager.workspace.read_unindexed().await;
+            workspace.documents[&child]
+                .syntax
+                .labels
+                .iter()
+                .any(|label| label.name == "hidden")
+                && workspace.documents[&provider].text.source == unsaved
+        };
+        std::fs::write(directory.path().join("finish-compile"), "").unwrap();
+        wait_build(&manager).await;
+        assert!(
+            preserved,
+            "saved compiler inputs replaced the live editor's parsed context"
+        );
+    }
+
     #[tokio::test]
     async fn explicit_cancellation_invalidates_a_detached_watcher_followup() {
         let directory = tempfile::tempdir().unwrap();
@@ -1059,6 +1497,7 @@ printf 'INPUT main.tex\n' > "$out/main.fls"
                 queued: Some(QueuedBuild {
                     uri: uri.clone(),
                     rebuild: true,
+                    saved: None,
                 }),
                 ..Default::default()
             },
@@ -1129,6 +1568,7 @@ printf 'INPUT main.tex\n' > "$out/main.fls"
                 queued: Some(QueuedBuild {
                     uri: uri.clone(),
                     rebuild: false,
+                    saved: None,
                 }),
                 ..Default::default()
             },
