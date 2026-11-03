@@ -44,6 +44,7 @@ struct Record {
     queued: Option<QueuedBuild>,
     rebuild: bool,
     preparing: bool,
+    // Saves and passive file events recheck the new inputs after preparation.
     preparing_saved: Option<Url>,
     cancel_generation: u64,
     inputs: BTreeMap<Url, InputSnapshot>,
@@ -765,6 +766,13 @@ impl BuildManager {
         {
             let mut state = self.state.lock().unwrap();
             for (root, record) in state.iter_mut() {
+                if verify_inputs && record.preparing {
+                    // These checks still describe the previous compilation.
+                    // A delayed save notification must not cancel a new run
+                    // before its own input snapshots have been installed.
+                    record.preparing_saved.get_or_insert_with(|| root.clone());
+                    continue;
+                }
                 // TeX may rewrite a database itself (e.g. filecontents).
                 // Watch notifications cannot identify the writer. For explicit
                 // pipelines, validate databases inside the output directory at
@@ -981,6 +989,51 @@ printf 'INPUT main.tex\n' > "$out/main.fls"
         assert_eq!(pending.await.unwrap().unwrap()["status"], "started");
         assert!(manager.state.lock().unwrap()[&uri].queued.is_none());
         wait_build(&manager).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(unix)]
+    async fn save_watchers_during_preparation_do_not_compare_previous_build_inputs() {
+        let (manager, directory, uri, source) = gated_preparation();
+        let before = InputSnapshot::file(&uri.to_file_path().unwrap());
+        let saved = source.replace("missing", "new-missing");
+        std::fs::write(uri.to_file_path().unwrap(), &saved).unwrap();
+        manager.workspace.write_changes().await.documents.insert(
+            uri.clone(),
+            crate::project::workspace::Document::new(&uri, saved, Some(2)),
+        );
+        manager.state.lock().unwrap().insert(
+            uri.clone(),
+            Record {
+                inputs: [(uri.clone(), before)].into(),
+                result: Some(json!({"status":"success", "buildId":0})),
+                ..Default::default()
+            },
+        );
+        let worker = manager.clone();
+        let main = uri.clone();
+        let pending = tokio::spawn(async move { worker.on_save(main).await });
+        wait_preparing(directory.path()).await;
+        let changes = crate::editing::file_operations::FileChanges::new([
+            uri.as_str(),
+            uri.join("4913").unwrap().as_str(),
+            uri.join("main.tex~").unwrap().as_str(),
+        ])
+        .unwrap();
+        let followups = manager.watched_files_changed(&changes).await;
+        assert!(followups.is_empty());
+        assert!(!manager.state.lock().unwrap()[&uri]
+            .active
+            .as_ref()
+            .unwrap()
+            .1
+            .load(Ordering::Relaxed));
+        std::fs::write(directory.path().join("release"), "").unwrap();
+        pending.await.unwrap().unwrap();
+        wait_build(&manager).await;
+        assert!(directory.path().join("compiled").exists());
+        assert_eq!(manager.status(&uri)["status"], "success");
+        assert!(manager.state.lock().unwrap()[&uri].queued.is_none());
     }
 
     #[tokio::test]
