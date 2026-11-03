@@ -146,6 +146,16 @@ buffer text. An additional full protocol audit reported 423 passes and three
 input-cancellation failures (including the separately documented pull-diagnostic
 race); those failures are not counted as passes for this repair.
 
+The subsequent input-admission repair distinguishes ordered editor sources
+from background metadata publication. Waiting requests preserve their source
+positions, and pull diagnostics retry once when only metadata changes. Four
+deterministic regressions cover preparation waits, diagnostic retries, the retry
+limit, and source comparisons; the three formerly failing protocol tests also
+passed ten independent replays each. The complete default `cargo test --locked`
+run passed 3,580 tests with 508 default ignores, including all 426 default
+protocol tests. See [development](development.md) for the request invalidation
+policy.
+
 ## Other command completion scenarios
 
 `benchmarks/completion_matrix.py` tests commands beyond `\input`: sectioning,
@@ -1032,5 +1042,6 @@ received `-32802` for request 1004. The installed baseline reproduced the same
 failure in five independent replays. The final serial protocol run passed 425
 tests with this one failure and 30 default ignores; all other 324 suites passed
 3144 tests with 478 default ignores. The new document-view admission and
-publication tests pass. This optimization does not claim to resolve the
-separate pull-diagnostic race.
+publication tests pass. That optimization did not resolve the separate
+pull-diagnostic race; the later input-admission repair described above addresses
+it with a bounded metadata retry.

@@ -22,6 +22,8 @@ cargo test --locked
 
 When running tests on macOS, you can use `TMPDIR=/private/tmp cargo test --locked` to avoid the `/var` and `/private/var` aliases of the system temporary directory from making the file URI inconsistent with the canonical path.
 
+Requests waiting for filesystem observations or dependency preparation retain the ordered open-document text and versions. Background distribution discovery and reparsing do not invalidate those positions. Edit queries and pull diagnostics recompute once when metadata changes without changing any source text or version; newer source inputs still invalidate the request. The diagnostic retry is bounded so repeated publication cannot keep a request waiting indefinitely.
+
 Incremental compilation is turned on by default for development and test builds, and the cache is reused to speed up repeated compilation after modifying the code; debugging information is still turned off by default. Incremental caching will increase disk usage. You can set `CARGO_INCREMENTAL=0` when you need to save space. When source code level debugging is required, `CARGO_PROFILE_DEV_DEBUG=2` or `CARGO_PROFILE_TEST_DEBUG=2` can be set as needed; release builds continue to use independent configurations.
 
 During continuous development, you can use `cargo clean --locked -p texquill --profile dev --dry-run` to preview the usage of debug products in this package. After confirming that there are no tests or builds running, remove `--dry-run` for cleaning. This will allow the next development/testing to rebuild this package, retaining the dependency cache, release products, and measurement files in `target/benchmarks`. Do not run builds or cleanups during benchmark measurements.

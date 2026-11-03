@@ -208,9 +208,16 @@ impl Backend {
         if self.workspace.obsolete_background_inputs().await {
             return Err(content_modified());
         }
-        self.wait_prepared_inputs().await?;
+        let ordered = self.wait_prepared_inputs().await?;
         let (workspace, revision, epoch) = {
             let workspace = self.workspace.read().await;
+            if !ordered
+                .workspace
+                .documents
+                .same_open_sources(&workspace.documents)
+            {
+                return Err(content_modified());
+            }
             (
                 workspace.clone(),
                 self.workspace.revision(),
@@ -324,9 +331,16 @@ impl Backend {
         &self,
         query: impl FnOnce(&Workspace) -> Result<T> + Clone + Send + 'static,
     ) -> Result<T> {
-        self.wait_file_events().await?;
+        let ordered = self.wait_file_events().await?;
         let (mut workspace, mut revision) = {
             let workspace = self.workspace.read().await;
+            if !ordered
+                .workspace
+                .documents
+                .same_open_sources(&workspace.documents)
+            {
+                return Err(content_modified());
+            }
             (workspace.clone(), self.workspace.revision())
         };
         let documents = workspace.documents.clone();
@@ -346,7 +360,7 @@ impl Backend {
             // Startup discovery or build metadata can finish during a query.
             // Recompute once with the new metadata only if every source revision
             // is identical; changed source positions must never be reinterpreted.
-            if attempt == 1 || !documents.same_revisions(&current.documents) {
+            if attempt == 1 || !documents.same_sources(&current.documents) {
                 return Err(crate::rpc::Error {
                     code: crate::rpc::ErrorCode::ServerError(-32801),
                     message: "Analysis inputs changed; request edits again".into(),
@@ -558,31 +572,39 @@ impl Backend {
         );
     }
 
-    async fn wait_file_events(&self) -> Result<()> {
+    async fn wait_file_events(&self) -> Result<Arc<crate::project::store::CompletionInputs>> {
+        let ordered = self.workspace.completion_inputs();
         if let Some(ticket) = self.file_refreshes.pending() {
-            let source = self.workspace.source_revision();
             dispatch::release();
             let _timing = crate::performance::Span::new("query.file_events");
             self.file_refreshes.wait(ticket).await;
-            if source != self.workspace.source_revision() {
+            let current = self.workspace.completion_inputs();
+            if !ordered
+                .workspace
+                .documents
+                .same_open_sources(&current.workspace.documents)
+            {
                 return Err(content_modified());
             }
         }
-        Ok(())
+        Ok(ordered)
     }
 
-    async fn wait_prepared_inputs(&self) -> Result<()> {
-        self.wait_file_events().await?;
-        let source = self.workspace.source_revision();
+    async fn wait_prepared_inputs(&self) -> Result<Arc<crate::project::store::CompletionInputs>> {
+        let ordered = self.wait_file_events().await?;
         loop {
             let changed = self.workspace.update_signal();
             let inputs = self.workspace.read_unindexed().await;
-            if self.workspace.source_revision() != source {
+            if !ordered
+                .workspace
+                .documents
+                .same_open_sources(&inputs.documents)
+            {
                 return Err(content_modified());
             }
             if !inputs.has_pending_dependencies() || !inputs.diagnostic_delivery.supports_refresh()
             {
-                return Ok(());
+                return Ok(ordered);
             }
             drop(inputs);
             dispatch::release();
@@ -604,12 +626,63 @@ impl Backend {
     async fn diagnostic_reports(
         &self,
         workspace: tokio::sync::OwnedRwLockReadGuard<Workspace>,
+        uri: Option<Url>,
+        previous: std::collections::BTreeMap<Url, String>,
+    ) -> Result<Vec<(Url, Option<i32>, DocumentDiagnosticReportKind)>> {
+        let mut revision = self.workspace.revision();
+        let mut snapshot = (*workspace).clone();
+        drop(workspace);
+        let documents = snapshot.documents.clone();
+        let delivery = snapshot.diagnostic_delivery.clone();
+        dispatch::release();
+        for attempt in 0..2 {
+            let uris: std::collections::BTreeSet<Url> = match &uri {
+                Some(uri) => [uri.clone()].into(),
+                None => snapshot
+                    .documents
+                    .keys()
+                    .cloned()
+                    .chain(
+                        snapshot
+                            .project
+                            .build_diagnostics
+                            .values()
+                            .flat_map(|project| project.keys().cloned()),
+                    )
+                    .chain(previous.keys().cloned())
+                    .collect(),
+            };
+            let result = self
+                .diagnostic_reports_once(snapshot, revision, uris.clone(), previous.clone())
+                .await;
+            if !result
+                .as_ref()
+                .is_err_and(|error| i64::from(error.code) == -32802)
+            {
+                return result;
+            }
+            let current = self.workspace.read_unindexed().await;
+            // Distribution discovery and derived publication can supersede an
+            // analysis without changing any source positions. Recompute once
+            // with that metadata; never reinterpret a newer editor revision.
+            if attempt == 1 || !documents.same_sources(&current.documents) {
+                drop(current);
+                delivery.publish(&self.client, vec![]).await;
+                return result;
+            }
+            snapshot = current.clone();
+            revision = self.workspace.revision();
+        }
+        unreachable!("A diagnostic query returns after at most two analyses")
+    }
+
+    async fn diagnostic_reports_once(
+        &self,
+        snapshot: Workspace,
+        revision: u64,
         uris: std::collections::BTreeSet<Url>,
         previous: std::collections::BTreeMap<Url, String>,
     ) -> Result<Vec<(Url, Option<i32>, DocumentDiagnosticReportKind)>> {
-        let revision = self.workspace.revision();
-        let snapshot = (*workspace).clone();
-        drop(workspace);
         let workspace = snapshot;
         let delivery = workspace.diagnostic_delivery.clone();
         let revisions = self.workspace.clone();
@@ -681,7 +754,7 @@ impl Backend {
                 })
                 .await
         };
-        let result = if refresh_supported {
+        if refresh_supported {
             tokio::select! {
                 biased;
                 _ = self.workspace.changed_since(revision) => Err(diagnostic_modified()),
@@ -689,16 +762,7 @@ impl Backend {
             }
         } else {
             work.await
-        };
-        if result
-            .as_ref()
-            .is_err_and(|error| i64::from(error.code) == -32802)
-        {
-            // One refresh replaces obsolete queued reports, including a
-            // revision invalidated by background distribution discovery.
-            delivery.publish(&self.client, vec![]).await;
         }
-        result
     }
 
     async fn publish_affected(&self, affected: std::collections::BTreeSet<Url>) {
@@ -1592,18 +1656,26 @@ impl Backend {
         if self.workspace.obsolete_diagnostic_inputs().await {
             return Err(diagnostic_modified());
         }
-        self.wait_prepared_inputs()
+        let ordered = self
+            .wait_prepared_inputs()
             .await
             .map_err(|_| diagnostic_modified())?;
         let uri = document_uri(params.text_document.uri);
         let workspace = self.workspace.clone().read_owned().await;
+        if !ordered
+            .workspace
+            .documents
+            .same_open_sources(&workspace.documents)
+        {
+            return Err(diagnostic_modified());
+        }
         let previous = params
             .previous_result_id
             .map(|previous| (uri.clone(), previous))
             .into_iter()
             .collect();
         let (_, _, report) = self
-            .diagnostic_reports(workspace, [uri].into_iter().collect(), previous)
+            .diagnostic_reports(workspace, Some(uri), previous)
             .await?
             .pop()
             .unwrap();
@@ -1632,7 +1704,8 @@ impl Backend {
         if self.workspace.obsolete_diagnostic_inputs().await {
             return Err(diagnostic_modified());
         }
-        self.wait_prepared_inputs()
+        let ordered = self
+            .wait_prepared_inputs()
             .await
             .map_err(|_| diagnostic_modified())?;
         let previous: std::collections::BTreeMap<_, _> = params
@@ -1641,21 +1714,15 @@ impl Backend {
             .map(|previous| (document_uri(previous.uri), previous.value))
             .collect();
         let workspace = self.workspace.clone().read_owned().await;
-        let uris = workspace
+        if !ordered
+            .workspace
             .documents
-            .keys()
-            .cloned()
-            .chain(
-                workspace
-                    .project
-                    .build_diagnostics
-                    .values()
-                    .flat_map(|project| project.keys().cloned()),
-            )
-            // Clear previously reported files which were removed.
-            .chain(previous.keys().cloned())
-            .collect();
-        let reports = self.diagnostic_reports(workspace, uris, previous).await?;
+            .same_open_sources(&workspace.documents)
+        {
+            return Err(diagnostic_modified());
+        }
+        // Include previously reported files to clear removed documents.
+        let reports = self.diagnostic_reports(workspace, None, previous).await?;
         let items = reports
             .into_iter()
             .map(|(uri, version, report)| {
@@ -3226,6 +3293,145 @@ mod read_query_tests {
     }
 
     #[tokio::test]
+    async fn ordered_input_waits_accept_metadata_but_reject_later_editor_changes() {
+        for preparing in [false, true] {
+            for edited in [false, true] {
+                let (client, _outgoing) = Client::new();
+                let backend = Backend::new(client);
+                let uri = Url::parse("untitled:waiting-edit.tex").unwrap();
+                {
+                    let mut workspace = backend.workspace.write().await;
+                    workspace.diagnostic_delivery = diagnostic::Delivery::new(true, true);
+                    workspace.open(uri.clone(), "Original".into(), 1);
+                    if preparing {
+                        workspace.defer_dependencies(uri.clone());
+                    }
+                }
+                let ticket = (!preparing).then(|| backend.file_refreshes.begin(false));
+                let mut query = Box::pin(async {
+                    backend.wait_prepared_inputs().await?;
+                    backend.read_edit_query(|ws| Ok(ws.client.snippets)).await
+                });
+                std::future::poll_fn(|cx| {
+                    assert!(std::future::Future::poll(query.as_mut(), cx).is_pending());
+                    std::task::Poll::Ready(())
+                })
+                .await;
+                {
+                    // Startup discovery publishes through the same input writer.
+                    let mut workspace = backend.workspace.write().await;
+                    workspace.client.snippets = true;
+                    if edited {
+                        workspace.open(uri.clone(), "Changed".into(), 2);
+                    }
+                }
+                drop(ticket);
+                let result = tokio::time::timeout(Duration::from_secs(1), query)
+                    .await
+                    .unwrap();
+                if edited {
+                    assert_eq!(i64::from(result.unwrap_err().code), -32801);
+                } else {
+                    assert!(result.unwrap(), "The new metadata was not incorporated");
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn pull_reports_retry_metadata_updates_but_reject_changed_editor_sources() {
+        for project in [false, true] {
+            for edited in [false, true] {
+                let (client, _outgoing) = Client::new();
+                let backend = Backend::new(client);
+                let uri = Url::parse("untitled:diagnostic-metadata.tex").unwrap();
+                {
+                    let mut workspace = backend.workspace.write().await;
+                    workspace.diagnostic_delivery = diagnostic::Delivery::new(true, true);
+                    workspace.open(uri.clone(), "\\ref{missing}".into(), 1);
+                }
+                let cache = backend.diagnostic_cache.lock().await;
+                let mut query = Box::pin(async {
+                    if project {
+                        backend
+                            .workspace_diagnostic(
+                                serde_json::from_value(serde_json::json!({"previousResultIds":[]}))
+                                    .unwrap(),
+                            )
+                            .await
+                            .map(|r| serde_json::to_value(r).unwrap())
+                    } else {
+                        backend
+                            .diagnostic(
+                                serde_json::from_value(
+                                    serde_json::json!({"textDocument":{"uri":uri}}),
+                                )
+                                .unwrap(),
+                            )
+                            .await
+                            .map(|r| serde_json::to_value(r).unwrap())
+                    }
+                });
+                std::future::poll_fn(|cx| {
+                    assert!(std::future::Future::poll(query.as_mut(), cx).is_pending());
+                    std::task::Poll::Ready(())
+                })
+                .await;
+                {
+                    let mut workspace = backend.workspace.write().await;
+                    workspace.config.diagnostics.undefined_references = false;
+                    if edited {
+                        workspace.open(uri.clone(), "Changed".into(), 2);
+                    }
+                }
+                drop(cache);
+                let result = tokio::time::timeout(Duration::from_secs(1), query)
+                    .await
+                    .unwrap();
+                if edited {
+                    assert_eq!(i64::from(result.unwrap_err().code), -32802);
+                } else {
+                    let result = result.unwrap();
+                    let report = if project {
+                        &result["items"][0]
+                    } else {
+                        &result
+                    };
+                    assert_eq!(report["items"], serde_json::json!([]), "{result}");
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn pull_report_metadata_retries_are_bounded_without_waiting_for_the_cache() {
+        let (client, _outgoing) = Client::new();
+        let backend = Backend::new(client);
+        let uri = Url::parse("untitled:diagnostic-retry-limit.tex").unwrap();
+        {
+            let mut workspace = backend.workspace.write().await;
+            workspace.diagnostic_delivery = diagnostic::Delivery::new(true, true);
+            workspace.open(uri.clone(), "Original".into(), 1);
+        }
+        let _cache = backend.diagnostic_cache.lock().await;
+        let mut query = Box::pin(backend.diagnostic(
+            serde_json::from_value(serde_json::json!({"textDocument":{"uri":uri}})).unwrap(),
+        ));
+        for snippets in [true, false] {
+            std::future::poll_fn(|cx| {
+                assert!(std::future::Future::poll(query.as_mut(), cx).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+            backend.workspace.write().await.client.snippets = snippets;
+        }
+        let result = tokio::time::timeout(Duration::from_secs(1), query)
+            .await
+            .unwrap();
+        assert_eq!(i64::from(result.unwrap_err().code), -32802);
+    }
+
+    #[tokio::test]
     async fn edit_queries_retry_metadata_updates_but_reject_changed_source_positions() {
         for source_changed in [false, true] {
             let (client, _outgoing) = Client::new();
@@ -3259,6 +3465,11 @@ mod read_query_tests {
                 workspace.client.snippets = true;
                 if source_changed {
                     workspace.open(uri, "new".into(), 2);
+                } else {
+                    workspace.documents.insert(
+                        uri.clone(),
+                        workspace::Document::new(&uri, "old".into(), Some(1)),
+                    );
                 }
             });
             let updated = tokio::time::timeout(Duration::from_secs(1), writer).await;

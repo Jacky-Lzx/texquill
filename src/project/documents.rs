@@ -94,15 +94,34 @@ impl Documents {
         scope
             .iter()
             .all(|uri| match (self.get(uri), other.get(uri)) {
-                (Some(left), Some(right)) => {
-                    std::ptr::eq(left, right)
-                        || left.version == right.version
-                            && left.kind == right.kind
-                            && left.text.source == right.text.source
-                }
+                (Some(left), Some(right)) => same_source(left, right),
                 (None, None) => true,
                 _ => false,
             })
+    }
+
+    pub(crate) fn same_sources(&self, other: &Self) -> bool {
+        self.len() == other.len()
+            && self
+                .iter()
+                .zip(other.iter())
+                .all(|((uri, left), (key, right))| uri == key && same_source(left, right))
+    }
+
+    /// Filesystem observations and reparsing may replace document identities.
+    /// Only changed editor text, versions, or open/close state invalidate the
+    /// positions of a request waiting for an earlier filesystem notification.
+    pub(crate) fn same_open_sources(&self, other: &Self) -> bool {
+        let mut left = self.iter().filter(|(_, doc)| doc.version.is_some());
+        let mut right = other.iter().filter(|(_, doc)| doc.version.is_some());
+        loop {
+            match (left.next(), right.next()) {
+                (Some((uri, left)), Some((key, right)))
+                    if uri == key && same_source(left, right) => {}
+                (None, None) => return true,
+                _ => return false,
+            }
+        }
     }
 
     /// Retain the ordered editor inputs of an interactive query while taking
@@ -224,6 +243,13 @@ impl Documents {
     }
 }
 
+fn same_source(left: &Document, right: &Document) -> bool {
+    std::ptr::eq(left, right)
+        || left.version == right.version
+            && left.kind == right.kind
+            && left.text.source == right.text.source
+}
+
 impl Index<&Url> for Documents {
     type Output = Document;
 
@@ -266,6 +292,44 @@ impl Extend<(Url, Document)> for Documents {
 mod tests {
     use super::*;
     use crate::project::workspace::Workspace;
+
+    #[test]
+    fn source_comparisons_distinguish_editor_inputs_from_closed_files_and_reparsing() {
+        let open = Url::parse("untitled:open.tex").unwrap();
+        let closed = Url::parse("untitled:closed.tex").unwrap();
+        let mut before = Documents::default();
+        before.insert(open.clone(), Document::new(&open, "Editor".into(), Some(1)));
+        before.insert(closed.clone(), Document::new(&closed, "Disk".into(), None));
+        let mut after = before.clone();
+        after.insert(open.clone(), Document::new(&open, "Editor".into(), Some(1)));
+        assert!(before.same_sources(&after));
+        assert!(before.same_open_sources(&after));
+        after.insert(
+            closed.clone(),
+            Document::new(&closed, "New disk".into(), None),
+        );
+        assert!(!before.same_sources(&after));
+        assert!(before.same_open_sources(&after));
+        for change in 0..5 {
+            let mut changed = after.clone();
+            match change {
+                0 => changed.get_mut(&open).unwrap().version = Some(2),
+                1 => {
+                    changed.insert(
+                        open.clone(),
+                        Document::new(&open, "New editor".into(), Some(1)),
+                    );
+                }
+                2 => changed.get_mut(&open).unwrap().version = None,
+                3 => changed.get_mut(&closed).unwrap().version = Some(1),
+                _ => {
+                    changed.remove(&open);
+                }
+            }
+            assert!(!before.same_open_sources(&changed));
+            assert!(!changed.same_open_sources(&before));
+        }
+    }
 
     #[test]
     fn weak_revisions_invalidate_in_place_updates_and_do_not_pin_old_documents() {
