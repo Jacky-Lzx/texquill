@@ -165,6 +165,16 @@ impl Plan {
         config: &BuildConfig,
         artifacts: bool,
     ) -> Result<Self, String> {
+        Self::prepare_protected(ws, root, config, artifacts, &[])
+    }
+
+    pub(crate) fn prepare_protected(
+        ws: &Workspace,
+        root: &Url,
+        config: &BuildConfig,
+        artifacts: bool,
+        protected_paths: &[PathBuf],
+    ) -> Result<Self, String> {
         let root_path = root
             .to_file_path()
             .map_err(|_| "Cleanup requires a local file")?;
@@ -185,6 +195,51 @@ impl Plan {
             .iter()
             .filter_map(|extension| config.artifact_path(&root_path, extension))
             .collect();
+        // Include auxiliaries are still known when an interrupted recorder
+        // has not flushed its OUTPUT lines yet.
+        let project = ws.project_files(root);
+        for (_, doc) in ws
+            .documents
+            .iter()
+            .filter(|(uri, _)| project.contains(*uri))
+        {
+            for command in doc
+                .syntax
+                .commands
+                .iter()
+                .filter(|command| command.name == "include")
+            {
+                let Some(argument) =
+                    crate::parser::syntax::file_argument(&doc.text.source, command)
+                else {
+                    continue;
+                };
+                let name = argument
+                    .value
+                    .trim()
+                    .strip_suffix(".tex")
+                    .unwrap_or(argument.value.trim());
+                if !crate::parser::syntax::is_literal_file_path(name)
+                    || Path::new(name).components().any(|part| {
+                        !matches!(
+                            part,
+                            std::path::Component::Normal(_) | std::path::Component::CurDir
+                        )
+                    })
+                {
+                    continue;
+                }
+                paths.insert(
+                    config
+                        .auxiliary_path(&root_path)
+                        .unwrap()
+                        .join(format!("{name}.aux")),
+                );
+                if paths.len() > 4096 {
+                    return Err("Cleanup file budget exceeded".into());
+                }
+            }
+        }
         if artifacts {
             paths.extend(
                 ["pdf", "synctex", "synctex.gz"]
@@ -273,6 +328,7 @@ impl Plan {
                 &root_path, config,
             ))
             .chain(std::iter::once(root_path))
+            .chain(protected_paths.iter().cloned())
             .filter_map(|path| path.canonicalize().ok())
             .collect();
         #[cfg(unix)]

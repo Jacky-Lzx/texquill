@@ -165,9 +165,10 @@ impl Plan {
         &self,
         build: &BuildConfig,
         cancel: &AtomicBool,
+        recovery: &crate::compilation::build::recovery::Recovery,
     ) -> Result<Processed, Failed> {
         let mut report = crate::diagnostics::index_diagnostics::Report::default();
-        match self.run_inner(build, cancel, &mut report) {
+        match self.run_inner(build, cancel, &mut report, recovery) {
             Ok(mut processed) => {
                 processed.report = report;
                 Ok(processed)
@@ -180,6 +181,7 @@ impl Plan {
         build: &BuildConfig,
         cancel: &AtomicBool,
         report: &mut crate::diagnostics::index_diagnostics::Report,
+        recovery: &crate::compilation::build::recovery::Recovery,
     ) -> Result<Processed, Failure> {
         let mut output = String::new();
         let mut tools = vec![];
@@ -236,6 +238,7 @@ impl Plan {
                 .map(|argument| expand(argument, &substitutions))
                 .collect::<Vec<_>>();
             let mut command = Command::new(&stage.config.executable);
+            recovery.inherit(&mut command);
             command.args(&arguments).current_dir(&self.output);
             let executed = crate::compilation::build_tools::execute(
                 command,

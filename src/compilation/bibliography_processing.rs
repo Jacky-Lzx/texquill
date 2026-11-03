@@ -97,6 +97,7 @@ impl Plan {
         &self,
         cancel: &AtomicBool,
         generated: &[Watched],
+        recovery: &crate::compilation::build::recovery::Recovery,
     ) -> Result<Processed, Failed> {
         let executable = self
             .config
@@ -150,6 +151,7 @@ impl Plan {
         }
         let parent = self.root.parent().unwrap();
         let mut command = Command::new(executable);
+        recovery.inherit(&mut command);
         command.args(&self.config.arguments);
         let mut search_output = String::new();
         for name in ["BIBINPUTS", "BSTINPUTS"] {

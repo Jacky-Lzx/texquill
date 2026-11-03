@@ -1,4 +1,5 @@
 //! Execute TeX tools and collect their observed outputs.
+use super::{recovery::Recovery, BuildInputs};
 use crate::{
     compilation::{
         build_log,
@@ -86,7 +87,10 @@ pub fn run(root: &Path, config: &BuildConfig, cancel: &AtomicBool) -> Outcome {
         cancel,
         false,
         None,
-        std::iter::once(root.to_path_buf()),
+        BuildInputs {
+            paths: vec![root.to_path_buf()],
+            protected: vec![],
+        },
     )
 }
 
@@ -97,7 +101,10 @@ pub fn rebuild(root: &Path, config: &BuildConfig, cancel: &AtomicBool) -> Outcom
         cancel,
         true,
         None,
-        std::iter::once(root.to_path_buf()),
+        BuildInputs {
+            paths: vec![root.to_path_buf()],
+            protected: vec![],
+        },
     )
 }
 
@@ -107,7 +114,7 @@ pub(crate) fn run_with_mode(
     cancel: &AtomicBool,
     rebuild: bool,
     previous_pdf: Option<&Snapshot>,
-    inputs: impl Iterator<Item = PathBuf>,
+    inputs: BuildInputs,
 ) -> Outcome {
     // A task can be cancelled while waiting for client progress registration,
     // before its worker starts. Preserve existing artifacts in that case.
@@ -127,6 +134,43 @@ pub(crate) fn run_with_mode(
         Err(message) => return Outcome::error(message),
     };
     let config = &config;
+    // Reject invalid arguments and explicit workflows before recovery can
+    // touch any artifacts, just as an ordinary build does.
+    if let Err(message) = if rebuild {
+        config.expanded_rebuild_arguments(root).map(|_| ())
+    } else {
+        config
+            .expanded_arguments(root)
+            .ok_or_else(|| "Invalid root filename".to_string())
+            .map(|_| ())
+    } {
+        return Outcome::error(message);
+    }
+    if !config.index_tools.is_empty() || config.bibliography_tool.is_some() {
+        if let Err(message) = config.rebuild_arguments() {
+            return Outcome::error(message);
+        }
+        if let Err(failure) = crate::compilation::index_processing::Plan::prepare(root, config) {
+            return Outcome::error(failure.message);
+        }
+        if let Err(failure) =
+            crate::compilation::bibliography_processing::Plan::prepare(root, config)
+        {
+            return Outcome::error(failure.message);
+        }
+    }
+    let protected: Vec<_> = inputs
+        .protected
+        .into_iter()
+        .chain(inputs.paths.iter().cloned())
+        .collect();
+    let mut recovery = match Recovery::begin(root, config, &protected) {
+        Ok(recovery) => recovery,
+        Err(message) => return Outcome::error(message),
+    };
+    if let Err(message) = recovery.mark_running() {
+        return Outcome::error(message);
+    }
     let default_latexmk = config.arguments.is_none()
         && config.rebuild_arguments.is_none()
         && Path::new(&config.executable)
@@ -135,10 +179,12 @@ pub(crate) fn run_with_mode(
     let refresh = !rebuild
         && default_latexmk
         && config.artifact_path(root, "pdf").is_some_and(|pdf| {
-            previous_pdf.is_none_or(|previous| !previous.matches_pdf(&pdf))
-                && outdated_pdf_input(&pdf, inputs, None).is_some()
+            previous_pdf.is_some_and(|previous| {
+                previous.matches_pdf(&pdf) && previous.changed_path().is_some()
+            }) || previous_pdf.is_none_or(|previous| !previous.matches_pdf(&pdf))
+                && outdated_pdf_input(&pdf, inputs.paths.into_iter(), None).is_some()
         });
-    let mut outcome = run_inner(root, config, cancel, rebuild || refresh);
+    let mut outcome = run_inner(root, config, cancel, rebuild || refresh, &recovery);
     // Another compiler invocation can update latexmk's cache and PDF without
     // updating this server's input history. If latexmk then skips TeX, establish
     // a fresh history rather than repeatedly rejecting its cached result.
@@ -157,7 +203,12 @@ pub(crate) fn run_with_mode(
             })
         })
     {
-        outcome = run_inner(root, config, cancel, true);
+        outcome = run_inner(root, config, cancel, true, &recovery);
+    }
+    if let Err(message) = recovery
+        .finish(outcome.exit_code.is_some() && !matches!(outcome.status, "cancelled" | "timeout"))
+    {
+        outcome = Outcome::error(format!("Cannot finish build recovery state: {message}"));
     }
     reject_outdated_pdf(
         root,
@@ -249,9 +300,15 @@ fn outdated_pdf_input(
     })
 }
 
-fn run_inner(root: &Path, config: &BuildConfig, cancel: &AtomicBool, rebuild: bool) -> Outcome {
+fn run_inner(
+    root: &Path,
+    config: &BuildConfig,
+    cancel: &AtomicBool,
+    rebuild: bool,
+    recovery: &Recovery,
+) -> Outcome {
     if config.index_tools.is_empty() && config.bibliography_tool.is_none() {
-        return run_single(root, config, cancel, rebuild, None, None);
+        return run_single(root, config, cancel, rebuild, None, None, recovery);
     }
     // Validate the entire explicit workflow before the first compiler touches
     // logs, including custom forced-pass arguments and style dependencies.
@@ -271,7 +328,7 @@ fn run_inner(root: &Path, config: &BuildConfig, cancel: &AtomicBool, rebuild: bo
         .auxiliary_path(root)
         .map(|output| bibliography_logs(&output))
         .unwrap_or_default();
-    let mut first = run_single(root, config, cancel, rebuild, None, None);
+    let mut first = run_single(root, config, cancel, rebuild, None, None, recovery);
     // An index-only document can legitimately have no pages until its first
     // .ind has been generated. A successful TeX process can still feed tools.
     if !matches!(first.status, "success" | "error")
@@ -287,7 +344,7 @@ fn run_inner(root: &Path, config: &BuildConfig, cancel: &AtomicBool, rebuild: bo
     for round in 1..=4 {
         let bibliography_processed = match bibliography
             .as_ref()
-            .map(|plan| plan.run(cancel, &first.generated_bibliography))
+            .map(|plan| plan.run(cancel, &first.generated_bibliography, recovery))
             .transpose()
         {
             Ok(processed) => processed,
@@ -309,7 +366,7 @@ fn run_inner(root: &Path, config: &BuildConfig, cancel: &AtomicBool, rebuild: bo
                 return stage_failure(first, failed.failure);
             }
         };
-        let processed = match plan.run(config, cancel) {
+        let processed = match plan.run(config, cancel, recovery) {
             Ok(processed) => processed,
             Err(failed) => {
                 first.diagnostics_truncated |= failed.report.truncated;
@@ -347,6 +404,7 @@ fn run_inner(root: &Path, config: &BuildConfig, cancel: &AtomicBool, rebuild: bo
                 bibliography_processed
                     .as_ref()
                     .map(|processed| processed.search_output.as_str()),
+                recovery,
             );
             final_pass.output = output_tail(&format!("{}\n{}", first.output, final_pass.output));
             final_pass.pdf_updated |= first.pdf_updated;
@@ -437,6 +495,7 @@ fn run_single(
     rebuild: bool,
     bibliography_baseline: Option<&BTreeMap<PathBuf, ArtifactFingerprint>>,
     bibliography_search: Option<&str>,
+    recovery: &Recovery,
 ) -> Outcome {
     let Some(parent) = root.parent() else {
         return Outcome::error("Invalid root path".into());
@@ -502,6 +561,7 @@ fn run_single(
         use std::os::unix::process::CommandExt;
         command.process_group(0);
     }
+    recovery.inherit(&mut command);
     let mut retries = 0;
     let mut child = loop {
         match command.spawn() {
@@ -517,6 +577,7 @@ fn run_single(
             }
         }
     };
+    recovery.spawned();
     let stdout = child.stdout.take().unwrap();
     let stderr = child.stderr.take().unwrap();
     let stdout = std::thread::spawn(move || capture(stdout));

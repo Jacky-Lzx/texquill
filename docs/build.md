@@ -119,7 +119,7 @@ For settings such as compiler, engine, root file, output directory, parameter te
 
 ## Save, cancel and import snapshots
 
-Please save project dependencies before compiling. When the input changes during compilation, the result will be marked as `stale`, and the server discards the old diagnostics; after turning on `onSave`, saves with changed inputs or build settings are merged into one subsequent compilation. Saving identical content during an active build does not queue another compilation, even if the editor rewrites the file or advances its document version. Existing queued saves and explicit forced rebuilds are retained.
+Please save project dependencies before compiling. Content changes and their watcher notifications let the active compiler finish writing auxiliary files; its result is marked `stale`, and the server discards the old diagnostics. After turning on `onSave`, changed saves are merged into one subsequent compilation. Saving identical content during an active build does not queue another compilation, even if the editor rewrites the file or advances its document version. Existing queued saves and explicit forced rebuilds are retained. Interrupted builds are recorded on disk so the next build can recover incomplete auxiliary files before compiling.
 
 See [Compilation Input and Expiration Results](build-inputs.md) for the validation rules for save checking, cancellation, recorder, document resources, file monitoring, and PDF / SyncTeX.
 

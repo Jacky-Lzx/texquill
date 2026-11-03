@@ -15,6 +15,7 @@ pub(super) struct Input {
     pub project: BTreeSet<Url>,
     pub static_code_inputs: BTreeSet<Url>,
     pub checks: Arc<crate::compilation::file_checks::Snapshot>,
+    pub invalidated: Arc<AtomicBool>,
     pub outcome: Outcome,
     pub wall_started: std::time::SystemTime,
     pub started: Instant,
@@ -31,6 +32,7 @@ pub(super) fn prepare(workspace: Workspace, input: Input) -> Publication {
         mut project,
         static_code_inputs,
         checks,
+        invalidated,
         mut outcome,
         wall_started,
         started,
@@ -298,10 +300,15 @@ pub(super) fn prepare(workspace: Workspace, input: Input) -> Publication {
         .filter_map(|input| input.snapshot())
         .collect();
     checks = Arc::new(checks.with_generated_bibliography(&generated));
+    if invalidated.load(Ordering::Relaxed) {
+        checks = Arc::new(checks.invalidated_artifact());
+    }
     // Include editor aliases of inputs first discovered by the recorder.
     project.extend(current.open_file_aliases(&project).into_keys());
-    let stale_reason = generated_changed
-        .then(|| "Generated bibliography inputs changed".to_string())
+    let stale_reason = invalidated
+        .load(Ordering::Relaxed)
+        .then(|| "Inputs changed during compilation".to_string())
+        .or_else(|| generated_changed.then(|| "Generated bibliography inputs changed".to_string()))
         .or_else(|| {
             open_aliases
                 .iter()
@@ -572,6 +579,7 @@ pub(super) fn prepare(workspace: Workspace, input: Input) -> Publication {
         checks,
         inputs,
         completed: matches!(outcome.status, "success" | "error"),
+        invalidated,
         affected,
         notifications,
     }
@@ -589,6 +597,7 @@ pub(super) struct Publication {
     pub checks: Arc<crate::compilation::file_checks::Snapshot>,
     pub inputs: BTreeMap<Url, InputSnapshot>,
     pub completed: bool,
+    pub invalidated: Arc<AtomicBool>,
     pub affected: BTreeSet<Url>,
     pub notifications: Vec<crate::diagnostics::diagnostic::Snapshot>,
 }
@@ -604,11 +613,19 @@ impl Publication {
         let configuration_changed = self.configuration
             != serde_json::to_value(&current.config).unwrap()
             || self.roots != current.roots;
-        let late_edit = configuration_changed
+        let invalidated = self.invalidated.load(Ordering::Relaxed);
+        let late_edit = invalidated
+            || configuration_changed
             || !self
                 .before
                 .same_sources_for(&current.documents, &self.scope);
         let reschedule_push = late_edit || !self.before.same_revisions(&current.documents);
+        if invalidated && self.completed {
+            self.checks = Arc::new(self.checks.invalidated_artifact());
+            if let Some(checks) = self.project.pdf_checks.get_mut(root) {
+                *checks = Arc::new(checks.invalidated_artifact());
+            }
+        }
         if late_edit && self.completed {
             if self.result["stale"] != true {
                 self.result["message"] = json!(format!(
@@ -656,6 +673,7 @@ mod tests {
             checks: Arc::default(),
             inputs: BTreeMap::new(),
             completed: true,
+            invalidated: Arc::default(),
             affected: [root.clone()].into(),
             notifications: vec![],
         }
@@ -686,6 +704,18 @@ mod tests {
             .insert(root.clone(), Arc::default());
         let publication = captured(&before, prepared, &root);
         assert!(!publication.invalidates_completion(&before, &root));
+    }
+
+    #[test]
+    fn watcher_invalidation_after_preparation_still_discards_the_result() {
+        let (before, root) = workspace();
+        let mut result = captured(&before, before.clone(), &root);
+        result.invalidated.store(true, Ordering::Relaxed);
+        let mut current = before;
+        assert!(result.merge_into(&mut current, &root));
+        assert_eq!(result.result["stale"], true);
+        assert_eq!(result.result["analysis"], Value::Null);
+        assert!(!current.project.build_diagnostics.contains_key(&root));
     }
 
     #[test]

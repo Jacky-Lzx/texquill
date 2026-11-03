@@ -17,6 +17,7 @@ impl BuildManager {
             checks,
             rebuild,
         } = input;
+        let invalidated = self.state.lock().unwrap()[&root_uri].invalidated.clone();
         let manager = self.clone();
         let guard = TaskGuard {
             tasks: self.tasks.clone(),
@@ -98,6 +99,14 @@ impl BuildManager {
                 .iter()
                 .filter_map(|uri| uri.to_file_path().ok())
                 .collect();
+            let protected = workspace
+                .read_unindexed()
+                .await
+                .documents
+                .iter()
+                .filter(|(_, doc)| doc.version.is_some())
+                .filter_map(|(uri, _)| uri.to_file_path().ok())
+                .collect();
             let wall_started = std::time::SystemTime::now();
             let outcome = tokio::task::spawn_blocking(move || {
                 run_with_mode(
@@ -106,7 +115,10 @@ impl BuildManager {
                     &cancel,
                     rebuild,
                     previous_pdf.as_deref(),
-                    worker_inputs.into_iter(),
+                    crate::compilation::build::BuildInputs {
+                        paths: worker_inputs,
+                        protected,
+                    },
                 )
             })
             .await;
@@ -126,6 +138,7 @@ impl BuildManager {
                         project,
                         static_code_inputs,
                         checks,
+                        invalidated,
                         outcome,
                         wall_started,
                         started,

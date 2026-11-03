@@ -40,6 +40,7 @@ impl notification::Notification for BuildFinished {
 #[derive(Default)]
 struct Record {
     active: Option<(u64, Arc<AtomicBool>)>,
+    invalidated: Arc<AtomicBool>,
     result: Option<Value>,
     queued: Option<QueuedBuild>,
     rebuild: bool,
@@ -527,6 +528,7 @@ impl BuildManager {
                 }
             }
             record.active = Some((build_id, cancel.clone()));
+            record.invalidated = Arc::new(AtomicBool::new(false));
             record.preparing = true;
             record.preparing_saved = None;
             record.rebuild = rebuild;
@@ -898,13 +900,22 @@ impl BuildManager {
                         .build
                         .on_save)
             {
+                // A watcher may precede didSave. Capture the refreshed editor
+                // state so an active compiler queues this request too.
+                let saved = match queued.saved {
+                    Some(saved) => Some(saved),
+                    None => Some(SavedInputs::capture(
+                        &*self.workspace.read_unindexed().await,
+                        self.saves.fetch_add(1, Ordering::SeqCst) + 1,
+                    )),
+                };
                 if let Err(error) = self
                     .start_saved_request(
                         queued.uri,
                         Some((root, generation)),
                         queued.rebuild,
                         None,
-                        queued.saved,
+                        saved,
                     )
                     .await
                 {
@@ -973,6 +984,38 @@ impl BuildManager {
                         .any(|uri| !defer_generated_database(uri) && affects(uri))
                         && record.checks.changed_path().is_some())
                 {
+                    let content_only = verify_inputs
+                        && !image_changed
+                        && record.checks.changed_path().is_none()
+                        && record.inputs.iter().all(|(uri, snapshot)| {
+                            !affects(uri)
+                                || !snapshot.changed(uri)
+                                || uri.to_file_path().is_ok_and(|path| {
+                                    std::fs::symlink_metadata(path)
+                                        .is_ok_and(|meta| meta.file_type().is_file())
+                                })
+                        });
+                    if content_only {
+                        if let Some((_, cancel)) = &record.active {
+                            if !cancel.load(Ordering::Relaxed) {
+                                // Let TeX close its auxiliary files normally.
+                                // Remember invalidation even if the bytes are
+                                // changed back before the compiler finishes.
+                                record.invalidated.store(true, Ordering::Relaxed);
+                                record.cancel_generation = record.cancel_generation.wrapping_add(1);
+                                followups.push(WatchedBuild {
+                                    root: root.clone(),
+                                    queued: record.queued.take().unwrap_or_else(|| QueuedBuild {
+                                        uri: root.clone(),
+                                        rebuild: false,
+                                        saved: None,
+                                    }),
+                                    generation: record.cancel_generation,
+                                });
+                            }
+                            continue;
+                        }
+                    }
                     let queued = record.queued.take();
                     record.cancel_generation = record.cancel_generation.wrapping_add(1);
                     // A watcher invalidates this run, not the user's request

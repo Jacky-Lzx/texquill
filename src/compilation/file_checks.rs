@@ -613,6 +613,16 @@ impl Snapshot {
         }
     }
 
+    /// A compiler which observed an input change may have read mixed revisions,
+    /// even when the final bytes match its starting snapshot again.
+    pub(crate) fn invalidated_artifact(&self) -> Self {
+        let mut snapshot = self.clone();
+        if let Some(artifact) = &self.artifact {
+            snapshot.ambiguous.insert(artifact.clone());
+        }
+        snapshot
+    }
+
     /// A verified pipeline may create a previously missing database itself.
     /// Do not relax existing identities or any other conditional candidate.
     pub(crate) fn with_generated_bibliography(
