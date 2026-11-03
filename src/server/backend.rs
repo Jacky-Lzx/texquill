@@ -246,6 +246,80 @@ impl Backend {
         }
     }
 
+    /// Static symbols and tokens consume one parsed document. Preserve work
+    /// across unrelated publication, retaining the ordered editor text/version.
+    async fn read_source_view<T: Send + 'static>(
+        &self,
+        uri: Url,
+        query: impl FnOnce(&Workspace) -> T + Send + 'static,
+    ) -> Result<T> {
+        if self.workspace.obsolete_background_inputs().await {
+            return Err(content_modified());
+        }
+        let ordered = self.workspace.completion_inputs();
+        let scope = [uri.clone()].into();
+        loop {
+            let prepared = self.wait_prepared_inputs().await;
+            let current = self.workspace.completion_inputs();
+            if !ordered
+                .workspace
+                .documents
+                .same_sources_for(&current.workspace.documents, &scope)
+            {
+                return Err(content_modified());
+            }
+            // A global input waiter can be invalidated by unrelated source
+            // publication. Retry admission, without rerunning the analysis.
+            if prepared.is_ok() {
+                break;
+            }
+        }
+        let (workspace, revision, epoch) = {
+            let workspace = self.workspace.read().await;
+            if !ordered
+                .workspace
+                .documents
+                .same_sources_for(&workspace.documents, &scope)
+            {
+                return Err(content_modified());
+            }
+            (
+                workspace.clone(),
+                self.workspace.revision(),
+                self.workspace.completion_epoch(),
+            )
+        };
+        let input = workspace.documents.weak_revision(&uri);
+        let revisions = self.workspace.clone();
+        let key = uri.clone();
+        let observed = input.clone();
+        let analysis = self.queries.analyses.clone();
+        dispatch::release();
+        let work = self.queries.run_background(move |_| {
+            let context = crate::analysis::AnalysisContext::cancellable(move || {
+                !revisions.document_input_current(&key, &observed)
+            });
+            if context.cancelled() {
+                return Err(content_modified());
+            }
+            let result = context.run(|_| {
+                crate::analysis::AnalysisContext::for_workspace(
+                    &workspace, epoch, revision, analysis,
+                )
+                .run(|_| query(&workspace))
+            });
+            if context.cancelled() {
+                return Err(content_modified());
+            }
+            Ok(result)
+        });
+        tokio::select! {
+            biased;
+            _ = self.workspace.document_input_changed(&uri, &input) => Err(content_modified()),
+            result = work => result,
+        }
+    }
+
     async fn read_edit_query<T: Send + 'static>(
         &self,
         query: impl FnOnce(&Workspace) -> Result<T> + Clone + Send + 'static,
@@ -2013,8 +2087,8 @@ impl Backend {
         &self,
         params: DocumentSymbolParams,
     ) -> Result<Option<DocumentSymbolResponse>> {
-        self.read_background_query(move |workspace| {
-            let uri = document_uri(params.text_document.uri);
+        let uri = document_uri(params.text_document.uri);
+        self.read_source_view(uri.clone(), move |workspace| {
             workspace.documents.get(&uri).map(|doc| {
                 if workspace.client.hierarchical_symbols {
                     DocumentSymbolResponse::Nested(features::symbols(doc))
@@ -2099,7 +2173,7 @@ impl Backend {
         let uri = document_uri(params.text_document.uri);
         let query_uri = uri.clone();
         let tokens = self
-            .read_background_query(move |workspace| {
+            .read_source_view(uri.clone(), move |workspace| {
                 workspace
                     .documents
                     .get(&query_uri)
@@ -2122,7 +2196,7 @@ impl Backend {
         let uri = document_uri(params.text_document.uri);
         let query_uri = uri.clone();
         let tokens = self
-            .read_background_query(move |workspace| {
+            .read_source_view(uri.clone(), move |workspace| {
                 workspace
                     .documents
                     .get(&query_uri)
@@ -2144,10 +2218,11 @@ impl Backend {
         &self,
         params: SemanticTokensRangeParams,
     ) -> Result<Option<SemanticTokensRangeResult>> {
-        self.read_background_query(move |workspace| {
+        let uri = document_uri(params.text_document.uri);
+        self.read_source_view(uri.clone(), move |workspace| {
             workspace
                 .documents
-                .get(&document_uri(params.text_document.uri))
+                .get(&uri)
                 .map(|doc| {
                     semantic::tokens(doc, Some(params.range)).map(SemanticTokensRangeResult::Tokens)
                 })
@@ -2978,6 +3053,79 @@ mod read_query_tests {
             !entered.load(Ordering::SeqCst),
             "obsolete queued analysis executed"
         );
+    }
+
+    #[tokio::test]
+    async fn source_views_wait_for_files_without_cancelling_on_unrelated_source_publication() {
+        for edit_target in [false, true] {
+            let (client, _outgoing) = Client::new();
+            let backend = Backend::new(client);
+            let uri = Url::parse("untitled:waiting-view.tex").unwrap();
+            backend.workspace.write().await.documents.insert(
+                uri.clone(),
+                workspace::Document::new(&uri, "Source".into(), Some(1)),
+            );
+            let ticket = backend.file_refreshes.begin(false);
+            let mut view = Box::pin(backend.read_source_view(uri.clone(), |_| "View"));
+            std::future::poll_fn(|context| {
+                assert!(std::future::Future::poll(view.as_mut(), context).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+            if edit_target {
+                backend.workspace.write_changes().await.documents.insert(
+                    uri.clone(),
+                    workspace::Document::new(&uri, "Edited".into(), Some(2)),
+                );
+            } else {
+                backend.workspace.write().await.client.snippets = true;
+            }
+            drop(ticket);
+            let result = tokio::time::timeout(Duration::from_secs(1), view)
+                .await
+                .unwrap();
+            if edit_target {
+                assert_eq!(i64::from(result.unwrap_err().code), -32801);
+            } else {
+                assert_eq!(result.unwrap(), "View");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn source_views_survive_build_diagnostic_publication_without_redoing_analysis() {
+        let (client, _outgoing) = Client::new();
+        let backend = Arc::new(Backend::new(client));
+        let uri = Url::parse("untitled:source-view.tex").unwrap();
+        backend.workspace.write().await.documents.insert(
+            uri.clone(),
+            workspace::Document::new(&uri, "Source".into(), Some(1)),
+        );
+        let (started, start) = oneshot::channel();
+        let (finish, finished) = oneshot::channel();
+        let reader = backend.clone();
+        let query_uri = uri.clone();
+        let task = tokio::spawn(async move {
+            reader
+                .read_source_view(query_uri, move |_| {
+                    started.send(()).unwrap();
+                    finished.blocking_recv().unwrap();
+                    "View"
+                })
+                .await
+        });
+        start.await.unwrap();
+        backend
+            .workspace
+            .write_prepared()
+            .await
+            .project
+            .lint_diagnostics
+            .insert(uri, vec![]);
+        backend.workspace.write().await.client.snippets = true;
+        backend.workspace.invalidate_completion();
+        finish.send(()).unwrap();
+        assert_eq!(task.await.unwrap().unwrap(), "View");
     }
 
     #[tokio::test]

@@ -30,13 +30,13 @@ impl DerefMut for WorkspaceUpdate<'_> {
         if !self.changed {
             self.revision.fetch_add(1, Ordering::SeqCst);
             self.changed = true;
-            self.updated.notify_waiters();
             if let Some(epoch) = self.completion_epoch {
                 epoch.fetch_add(1, Ordering::SeqCst);
             }
             if let Some(revision) = self.source_revision {
                 revision.fetch_add(1, Ordering::SeqCst);
             }
+            self.updated.notify_waiters();
         }
         &mut self.workspace
     }
@@ -69,6 +69,9 @@ impl Drop for WorkspaceUpdate<'_> {
             let next =
                 CompletionInputs::capture(&self.workspace, self.epoch.load(Ordering::SeqCst));
             CompletionInputs::publish(self.completion_inputs, next);
+            // Document-bound waiters must also observe the published pointer,
+            // after the early revision invalidation signal.
+            self.updated.notify_waiters();
         }
     }
 }
@@ -228,6 +231,34 @@ impl WorkspaceStore {
 
     pub(crate) fn invalidate_completion(&self) {
         self.completion_epoch.fetch_add(1, Ordering::SeqCst);
+        self.updated.notify_waiters();
+    }
+
+    pub(crate) fn document_input_current(
+        &self,
+        uri: &lsp_types::Url,
+        input: &Option<std::sync::Weak<super::workspace::Document>>,
+    ) -> bool {
+        let current = self.completion_inputs();
+        match (input, current.workspace.documents.get(uri)) {
+            (Some(input), Some(document)) => std::ptr::eq(input.as_ptr(), document),
+            (None, None) => true,
+            _ => false,
+        }
+    }
+
+    pub(crate) async fn document_input_changed(
+        &self,
+        uri: &lsp_types::Url,
+        input: &Option<std::sync::Weak<super::workspace::Document>>,
+    ) {
+        loop {
+            let updated = self.updated.notified();
+            if !self.document_input_current(uri, input) {
+                return;
+            }
+            updated.await;
+        }
     }
 
     pub(crate) fn completion_epoch(&self) -> u64 {
@@ -388,6 +419,54 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_secs(1), unpolled)
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn document_waiters_ignore_unrelated_inputs_but_wake_after_target_publication() {
+        for remove in [false, true] {
+            let store = WorkspaceStore::default();
+            let uri = lsp_types::Url::parse("untitled:document-view.tex").unwrap();
+            store.write_changes().await.documents.insert(
+                uri.clone(),
+                super::super::workspace::Document::new(&uri, "Source".into(), Some(1)),
+            );
+            let current = store.completion_inputs();
+            let input = current.workspace.documents.weak_revision(&uri);
+            let mut changed = Box::pin(store.document_input_changed(&uri, &input));
+            std::future::poll_fn(|context| {
+                assert!(std::future::Future::poll(changed.as_mut(), context).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+            store.write().await.client.snippets = true;
+            std::future::poll_fn(|context| {
+                assert!(std::future::Future::poll(changed.as_mut(), context).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+            {
+                let mut update = store.write_changes().await;
+                if remove {
+                    update.documents.remove(&uri);
+                } else {
+                    update.documents.insert(
+                        uri.clone(),
+                        super::super::workspace::Document::new(&uri, "Edited".into(), Some(2)),
+                    );
+                }
+                assert!(store.document_input_current(&uri, &input));
+                // Consume the early revision signal while the old pointer is
+                // still published; dropping the guard must wake us again.
+                std::future::poll_fn(|context| {
+                    assert!(std::future::Future::poll(changed.as_mut(), context).is_pending());
+                    std::task::Poll::Ready(())
+                })
+                .await;
+            }
+            tokio::time::timeout(std::time::Duration::from_secs(1), changed)
+                .await
+                .unwrap();
+        }
     }
 
     #[tokio::test]
