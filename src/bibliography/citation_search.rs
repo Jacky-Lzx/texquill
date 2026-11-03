@@ -6,7 +6,7 @@ use crate::{
 use lsp_types::*;
 use std::{collections::BTreeSet, ops::Range};
 
-fn score(name: &str, metadata: &str, query: &str) -> Option<u8> {
+pub(crate) fn score(name: &str, metadata: &str, query: &str) -> Option<u8> {
     if name.starts_with(query) {
         return Some(0);
     }
@@ -98,6 +98,18 @@ pub(crate) fn items(
     scope: &BTreeSet<Url>,
     unique: bool,
 ) -> Option<Vec<CompletionItem>> {
+    items_with_query(ws, doc, offset, span, scope, unique, false)
+}
+
+fn items_with_query(
+    ws: &Workspace,
+    doc: &Document,
+    offset: usize,
+    span: Range<usize>,
+    scope: &BTreeSet<Url>,
+    unique: bool,
+    all: bool,
+) -> Option<Vec<CompletionItem>> {
     let mut ambiguous = BTreeSet::new();
     if unique {
         let mut names = BTreeSet::new();
@@ -117,7 +129,7 @@ pub(crate) fn items(
             }
         }
     }
-    candidate_items(
+    candidate_items_with_query(
         ws,
         doc,
         offset,
@@ -134,6 +146,7 @@ pub(crate) fn items(
                     .map(move |entry| (uri, entry.name.as_str(), entry.detail.as_str()))
             }),
         ws.completion_budget(),
+        all,
     )
 }
 pub(crate) fn candidate_items<'a>(
@@ -144,8 +157,25 @@ pub(crate) fn candidate_items<'a>(
     candidates: impl IntoIterator<Item = (&'a Url, &'a str, &'a str)>,
     limit: usize,
 ) -> Option<Vec<CompletionItem>> {
+    candidate_items_with_query(ws, doc, offset, span, candidates, limit, false)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn candidate_items_with_query<'a>(
+    ws: &Workspace,
+    doc: &Document,
+    offset: usize,
+    span: Range<usize>,
+    candidates: impl IntoIterator<Item = (&'a Url, &'a str, &'a str)>,
+    limit: usize,
+    all: bool,
+) -> Option<Vec<CompletionItem>> {
     let source = &doc.text.source;
-    let query = source[span.start..offset].trim();
+    let query = if all {
+        ""
+    } else {
+        source[span.start..offset].trim()
+    };
     if query.chars().count() > 128 {
         return Some(vec![]);
     }
@@ -197,6 +227,25 @@ pub(crate) fn completion(
     offset: usize,
     scope: &BTreeSet<Url>,
 ) -> Option<Vec<CompletionItem>> {
+    completion_with_query(ws, uri, offset, scope, false)
+}
+
+pub(crate) fn completion_unfiltered(
+    ws: &Workspace,
+    uri: &Url,
+    offset: usize,
+    scope: &BTreeSet<Url>,
+) -> Option<Vec<CompletionItem>> {
+    completion_with_query(ws, uri, offset, scope, true)
+}
+
+fn completion_with_query(
+    ws: &Workspace,
+    uri: &Url,
+    offset: usize,
+    scope: &BTreeSet<Url>,
+    all: bool,
+) -> Option<Vec<CompletionItem>> {
     let doc = ws.documents.get(uri)?;
     if doc.kind != DocumentKind::Latex {
         return None;
@@ -216,7 +265,7 @@ pub(crate) fn completion(
         {
             return Some(Vec::new());
         }
-        return items(ws, doc, offset, span, scope, false);
+        return items_with_query(ws, doc, offset, span, scope, false, all);
     }
     None
 }

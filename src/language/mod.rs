@@ -1,5 +1,6 @@
 //! Language features and their request-specific caches and resolvers.
 
+pub(crate) mod argument_cache;
 pub(crate) mod call_hierarchy;
 pub mod code_lens;
 pub mod colors;

@@ -1258,6 +1258,26 @@ pub(crate) fn completion_in_query(
     uri: &Url,
     position: Position,
 ) -> Vec<CompletionItem> {
+    completion_with_prefix(workspace, uri, position, false, &mut false)
+}
+
+pub(crate) fn completion_unfiltered(
+    workspace: &Workspace,
+    uri: &Url,
+    position: Position,
+) -> Option<Vec<CompletionItem>> {
+    let mut keys = false;
+    let items = completion_with_prefix(workspace, uri, position, true, &mut keys);
+    keys.then_some(items)
+}
+
+fn completion_with_prefix(
+    workspace: &Workspace,
+    uri: &Url,
+    position: Position,
+    all_keys: bool,
+    keys: &mut bool,
+) -> Vec<CompletionItem> {
     let Some(doc) = workspace.documents.get(uri) else {
         return vec![];
     };
@@ -1329,9 +1349,15 @@ pub(crate) fn completion_in_query(
         }
     }
     if !name_command {
-        if let Some(items) =
+        let items = if all_keys {
+            crate::bibliography::citation_search::completion_unfiltered(
+                workspace, uri, offset, &scope,
+            )
+        } else {
             crate::bibliography::citation_search::completion(workspace, uri, offset, &scope)
-        {
+        };
+        if let Some(items) = items {
+            *keys = true;
             return items;
         }
     }
@@ -1402,7 +1428,11 @@ pub(crate) fn completion_in_query(
                 crate::language::path_completion::complete(workspace, uri, &command.name, span)
             };
         }
-        let prefix = &doc.text.source[span.clone()];
+        let prefix = if all_keys {
+            ""
+        } else {
+            &doc.text.source[span.clone()]
+        };
         // Replace the rest of this key too when completing inside an existing
         // reference/environment; separators and following arguments stay intact.
         let suffix_length = doc.text.source[offset..]
@@ -1546,6 +1576,7 @@ pub(crate) fn completion_in_query(
                 }
             }
         }
+        *keys = matches!(kind, Some(TargetKind::Label | TargetKind::Citation));
         let environment_docs = (kind.is_none())
             .then(|| crate::language::completion_resolve::Commands::new(workspace, uri, &scope));
         return candidates

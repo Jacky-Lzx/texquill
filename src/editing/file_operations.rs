@@ -62,6 +62,17 @@ impl FileChanges {
             .collect()
     }
 
+    pub(crate) fn changes_source_set(&self, workspace: &Workspace) -> bool {
+        self.changes_configuration()
+            || self.0.iter().any(|path| {
+                path.is_dir()
+                    || crate::project::workspace::is_source(path)
+                        && Url::from_file_path(path)
+                            .ok()
+                            .is_none_or(|uri| !workspace.documents.contains_key(&uri))
+            })
+    }
+
     pub(crate) fn changes_configuration(&self) -> bool {
         self.0.iter().any(|path| {
             path.file_name()

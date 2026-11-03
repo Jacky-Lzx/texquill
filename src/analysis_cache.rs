@@ -140,6 +140,9 @@ impl Binding {
         if !files.current() {
             return None;
         }
+        if let Some(context) = crate::analysis::AnalysisContext::current() {
+            context.observe_files(&files);
+        }
         let mut state = self.cache.0.lock().unwrap();
         if let Some(index) = state
             .indexes

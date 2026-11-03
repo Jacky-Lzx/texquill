@@ -81,7 +81,12 @@ pub(crate) fn changed_candidate(before: &Document, after: &Document) -> bool {
 
 impl Prepared {
     pub(crate) fn build(ws: &Workspace, origin: &Url, epoch: u64) -> Option<Self> {
-        let (slots, files) = Files::capture(|| Self::slots(ws, origin));
+        let (slots, files) = Files::capture(|| {
+            crate::analysis::AnalysisContext::new().run(|_| {
+                super::completion_cache::observe_closed(ws);
+                Self::slots(ws, origin)
+            })
+        });
         Self::retain(ws, origin, epoch, slots, files)
     }
 
@@ -94,6 +99,7 @@ impl Prepared {
         // One observed immutable query supplies both the response and its proof.
         // Keep its local indexes alive while certifying the input context.
         let ((items, slots), files) = Files::capture(|| {
+            super::completion_cache::observe_closed(ws);
             crate::analysis::AnalysisContext::new().run(|_| {
                 let items = super::features::completion_in_query(ws, origin, position);
                 (items, Self::slots(ws, origin))
@@ -171,7 +177,7 @@ impl Prepared {
         slots: Vec<Slot>,
         files: Arc<Files>,
     ) -> Option<Self> {
-        if slots.is_empty() || !files.current() {
+        if slots.is_empty() || !files.current_for_editor(ws) {
             return None;
         }
         let result = Self {
@@ -246,7 +252,7 @@ impl Prepared {
                 (literal(value) && unresolved(&self.origin, value)).then_some(span)
             })
             .collect();
-        (!spans.is_empty() && self.files.current()).then_some(spans)
+        (!spans.is_empty() && self.files.current_for_editor(ws)).then_some(spans)
     }
     pub(crate) fn valid_for(&self, ws: &Workspace, epoch: u64) -> bool {
         self.spans(ws, epoch).is_some()

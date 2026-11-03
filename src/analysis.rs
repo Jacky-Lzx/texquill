@@ -62,10 +62,6 @@ impl AnalysisContext {
         context
     }
 
-    pub(crate) fn observing_files(&self) -> bool {
-        self.observed.is_some()
-    }
-
     pub(crate) fn persistent_indexes(&self) -> bool {
         self.persistent_indexes
     }
@@ -139,6 +135,12 @@ impl AnalysisContext {
     pub(crate) fn observe(&self, path: &Path) {
         if let Some(files) = &self.observed {
             files.borrow_mut().observe(path);
+        }
+    }
+
+    pub(crate) fn observe_files(&self, observations: &Files) {
+        if let Some(files) = &self.observed {
+            files.borrow_mut().extend(observations);
         }
     }
 

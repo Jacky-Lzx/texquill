@@ -932,3 +932,22 @@ TEXQUILL_PROFILE="$PWD/target/performance/completion-stages.jsonl" \
   python3 benchmarks/completion_matrix_ui.py /path/to/paper \
   --modes save --cases reference citation environment
 ```
+
+Prepared completion certificates now distinguish document identity from the
+lexical inputs used by candidates. Command pools survive ordinary prose edits
+in other buffers; declaration bodies, parameter readers, load structure and
+macro documentation remain part of their conservative keys. Large or opaque
+inputs retain exact text proofs. Filesystem observations also validate closed
+sources and missing inputs. Saving authoritative open editor text does not by
+itself invalidate these observations; deletion and symlink retargeting do.
+
+Simple literal reference and citation arguments have a separate bounded pool
+of unfiltered candidates. The server filters these lists and rebuilds UTF-16
+edits for each cursor, including backspace and mid-key completion. Citation
+metadata search and ranking share the existing scorer. Coalesced background
+preparation and the first semantic response can both populate this pool.
+Custom readers, complex/list arguments, incomplete indexing, and candidate or
+memory limits retain the semantic provider. Environment arguments and graphics
+paths retain their contextual providers. File events that may introduce a new
+source or directory wait for discovery; unrelated events can reuse candidates
+whose disk observations still validate.

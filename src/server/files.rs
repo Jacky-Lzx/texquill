@@ -6,7 +6,10 @@ use crate::{
 use lsp_types::Url;
 use std::{
     collections::BTreeSet,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex,
+    },
 };
 use tokio::sync::Notify;
 
@@ -21,21 +24,30 @@ struct State {
 pub(super) struct Refreshes {
     state: Arc<Mutex<State>>,
     updated: Arc<Notify>,
+    source_sets: Arc<AtomicUsize>,
 }
 
 pub(super) struct Ticket {
     owner: Refreshes,
     number: u64,
+    source_set: bool,
 }
 
 impl Refreshes {
-    pub fn begin(&self) -> Ticket {
+    pub fn begin(&self, source_set: bool) -> Ticket {
         let mut state = self.state.lock().unwrap();
         state.issued += 1;
+        if source_set {
+            self.source_sets.fetch_add(1, Ordering::SeqCst);
+        }
         Ticket {
             owner: self.clone(),
             number: state.issued,
+            source_set,
         }
+    }
+    pub fn source_set_pending(&self) -> bool {
+        self.source_sets.load(Ordering::SeqCst) != 0
     }
     pub fn pending(&self) -> Option<u64> {
         let state = self.state.lock().unwrap();
@@ -60,6 +72,9 @@ impl Ticket {
 impl Drop for Ticket {
     fn drop(&mut self) {
         let mut state = self.owner.state.lock().unwrap();
+        if self.source_set {
+            self.owner.source_sets.fetch_sub(1, Ordering::SeqCst);
+        }
         state.dropped.insert(self.number);
         loop {
             let next = state.finished + 1;
@@ -78,17 +93,22 @@ pub(super) struct Prepared {
     pub affected: BTreeSet<Url>,
 }
 impl Prepared {
+    #[cfg(test)]
     pub fn build(mut workspace: Workspace, changes: &FileChanges, watched: bool) -> Self {
+        Self::prepare(&mut workspace, changes, watched)
+    }
+
+    pub fn prepare(workspace: &mut Workspace, changes: &FileChanges, watched: bool) -> Self {
         let before = workspace.clone();
         workspace.refresh_pending_dependencies();
         let affected = if watched {
-            changes.refresh_watched(&mut workspace)
+            changes.refresh_watched(workspace)
         } else {
-            changes.refresh(&mut workspace)
+            changes.refresh(workspace)
         };
         Self {
             before,
-            after: workspace,
+            after: workspace.clone(),
             affected,
         }
     }
@@ -158,8 +178,8 @@ mod tests {
     #[tokio::test]
     async fn observation_tickets_finish_in_order_even_when_a_waiter_is_cancelled() {
         let refreshes = Refreshes::default();
-        let first = refreshes.begin();
-        let second = refreshes.begin();
+        let first = refreshes.begin(true);
+        let second = refreshes.begin(true);
         let last = refreshes.pending().unwrap();
         drop(second);
         assert!(

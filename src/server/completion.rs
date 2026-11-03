@@ -39,6 +39,9 @@ impl Completion {
         }
     }
 
+    pub(crate) fn remember_argument(&self, prepared: crate::language::argument_cache::Prepared) {
+        self.cache.lock().unwrap().insert_argument(prepared);
+    }
     pub(crate) fn remember_path(&self, prepared: crate::language::path_cache::Prepared) {
         self.cache.lock().unwrap().insert_paths(prepared);
     }
@@ -186,6 +189,7 @@ impl Completion {
                     );
                     let mut prepared = Vec::new();
                     let mut paths = Vec::new();
+                    let mut arguments = Vec::new();
                     for uri in &origins {
                         let Some(doc) = snapshot.documents.get(uri) else {
                             continue;
@@ -200,6 +204,24 @@ impl Completion {
                                 prepared.push(entry);
                             }
                         }
+                        if doc.version.is_some() {
+                            for position in crate::language::argument_cache::positions(doc) {
+                                context.check()?;
+                                if !cache
+                                    .lock()
+                                    .unwrap()
+                                    .covers_argument(&snapshot, epoch, uri, position)
+                                {
+                                    if let Some(entry) = shared.run(|_| {
+                                        crate::language::argument_cache::Prepared::build(
+                                            &snapshot, uri, position, epoch,
+                                        )
+                                    }) {
+                                        arguments.push(entry);
+                                    }
+                                }
+                            }
+                        }
                         if doc.version.is_some()
                             && !cache.lock().unwrap().covers_paths(&snapshot, epoch, uri)
                         {
@@ -212,7 +234,7 @@ impl Completion {
                     }
                     context.check()?;
                     cancel.check()?;
-                    Ok((snapshot, changed, prepared, paths))
+                    Ok((snapshot, changed, prepared, paths, arguments))
                 })
             };
             // A native input request needs its certificate during typing.
@@ -232,7 +254,7 @@ impl Completion {
             };
             let mut retry;
             let observed;
-            if let Ok((snapshot, changed, prepared, paths)) = result {
+            if let Ok((snapshot, changed, prepared, paths, arguments)) = result {
                 let delivery = snapshot.diagnostic_delivery.clone();
                 let mut inputs = workspace.write_prepared().await;
                 let current = workspace.source_revision() == source_revision
@@ -253,6 +275,11 @@ impl Completion {
                 for entry in paths {
                     if entry.valid_for(&inputs, workspace.completion_epoch()) {
                         self.cache.lock().unwrap().insert_paths(entry);
+                    }
+                }
+                for entry in arguments {
+                    if entry.valid_for(&inputs, workspace.completion_epoch()) {
+                        self.cache.lock().unwrap().insert_argument(entry);
                     }
                 }
                 observed = workspace.revision();

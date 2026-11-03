@@ -83,7 +83,7 @@ impl Index {
         let index = if let Some(binding) = context
             .binding
             .as_ref()
-            .filter(|_| context.persistent_indexes() && !context.observing_files())
+            .filter(|_| context.persistent_indexes())
         {
             if let Some(index) = binding.index(workspace, root) {
                 index
@@ -91,6 +91,7 @@ impl Index {
                 let (index, files) = crate::diagnostics::diagnostic_inputs::Files::capture(|| {
                     AnalysisContext::new().run(|_| Self::build(workspace, root))
                 });
+                context.observe_files(&files);
                 if !context.cancelled() {
                     binding.insert_index(workspace, root, &index, files);
                 }

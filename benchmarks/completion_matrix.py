@@ -75,7 +75,7 @@ CASES = [
     ),
     case(
         "package",
-        r"\usepackage{codex-pp",
+        r"\usepackage{codex-p",
         "codex-package.sty",
         ["codex-package"],
         [r"\usepackage{codex-package}"],

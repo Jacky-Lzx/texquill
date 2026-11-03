@@ -649,7 +649,9 @@ impl Backend {
             }
         };
         let _timing = crate::performance::Span::new("files.total");
-        let ticket = self.file_refreshes.begin();
+        let changes_source_set =
+            changes.changes_source_set(&*self.workspace.read_unindexed().await);
+        let ticket = self.file_refreshes.begin(changes_source_set);
         // Reserve the observation in wire order before allowing edits and
         // queries to proceed. Queries that need these files await its ticket.
         dispatch::release();
@@ -685,10 +687,15 @@ impl Backend {
                     });
                     context.run(|context| {
                         context.check()?;
+                        // The analysis binding identifies this workspace by
+                        // address; keep it in place throughout preparation.
+                        let mut snapshot = snapshot;
                         let prepared = crate::analysis::AnalysisContext::for_workspace(
                             &snapshot, epoch, revision, analyses,
                         )
-                        .run(|_| super::files::Prepared::build(snapshot, &events, from_watcher));
+                        .run(|_| {
+                            super::files::Prepared::prepare(&mut snapshot, &events, from_watcher)
+                        });
                         context.check()?;
                         Ok(prepared)
                     })
@@ -1090,7 +1097,8 @@ impl Backend {
             return;
         };
         let updated = doc.with_text(&uri, text.source, Some(params.text_document.version));
-        let prepare_path = crate::language::path_cache::changed_candidate(doc, &updated);
+        let prepare_path = crate::language::path_cache::changed_candidate(doc, &updated)
+            || crate::language::argument_cache::changed_candidate(doc, &updated);
         let prepare_commands = crate::language::command_index::changed_declarations(doc, &updated);
         workspace.documents.insert(uri.clone(), updated);
         workspace.clear_build_diagnostics(&uri);
@@ -1238,7 +1246,12 @@ impl Backend {
         params: ExecuteCommandParams,
     ) -> Result<Option<serde_json::Value>> {
         if params.command != "latex.cancelBuild" {
-            self.wait_file_events().await?;
+            // Commands have no captured text positions. Later edits must not
+            // turn an ordered build/status request into ContentModified.
+            if let Some(ticket) = self.file_refreshes.pending() {
+                dispatch::release();
+                self.file_refreshes.wait(ticket).await;
+            }
         }
 
         if params.command == "latex.reindex" {
@@ -1662,10 +1675,9 @@ impl Backend {
             let position = &params.text_document_position;
             let inputs = self.workspace.completion_inputs();
             let workspace = &inputs.workspace;
-            let prepared = self
-                .file_refreshes
-                .pending()
-                .is_none()
+            // Every prepared provider validates its file observations, so an
+            // unrelated file notification need not stall certified candidates.
+            let prepared = (!self.file_refreshes.source_set_pending())
                 .then(|| {
                     self.completion.complete(
                         workspace,
@@ -1723,6 +1735,27 @@ impl Backend {
                     completion.remember_path(prepared);
                 }
                 items
+            } else if workspace.documents.get(&uri).is_some_and(|doc| {
+                crate::language::argument_cache::candidate(doc, position.position)
+            }) {
+                if let Some(prepared) = crate::language::argument_cache::Prepared::build(
+                    workspace,
+                    &uri,
+                    position.position,
+                    epoch,
+                ) {
+                    let items = prepared
+                        .complete(workspace, epoch, position.position)
+                        .unwrap();
+                    if !crate::analysis::AnalysisContext::current()
+                        .is_some_and(|context| context.cancelled())
+                    {
+                        completion.remember_argument(prepared);
+                    }
+                    items
+                } else {
+                    features::completion(workspace, &uri, position.position)
+                }
             } else {
                 features::completion(workspace, &uri, position.position)
             };
@@ -2155,7 +2188,7 @@ mod read_query_tests {
                 workspace::Document::new(&disk, "Old disk".into(), None),
             );
         }
-        let ticket = backend.file_refreshes.begin();
+        let ticket = backend.file_refreshes.begin(true);
         let reader = backend.clone();
         let open = uri.clone();
         let query = tokio::spawn(async move {

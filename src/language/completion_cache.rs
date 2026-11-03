@@ -1,6 +1,7 @@
 //! Prepared command candidates. No cached item owns a cursor-dependent edit.
 use super::{completion_resolve, features, math_context, signature};
 use crate::{
+    diagnostics::diagnostic_inputs::Files,
     parser::syntax,
     project::{
         catalog::{COMMANDS, PRIMITIVES},
@@ -26,7 +27,7 @@ const MAX_SOURCE: usize = 32 * 1024;
 
 struct Inputs {
     origin: Url,
-    documents: Vec<(Url, Weak<Document>)>,
+    documents: Vec<Dependency>,
     epoch: u64,
     key: String,
     shapes: BTreeMap<String, Option<CommandShape>>,
@@ -40,6 +41,76 @@ pub(crate) struct Prepared {
     math: Vec<CompletionItem>,
     signatures: BTreeMap<String, Option<Signature>>,
     bytes: usize,
+    files: Arc<Files>,
+}
+
+/// A changed document identity need not change candidate semantics. Retain
+/// conservative lexical keys; opaque/large documents require exact source.
+pub(crate) struct Dependency {
+    uri: Url,
+    revision: Weak<Document>,
+    kind: DocumentKind,
+    hint: Option<DocumentKind>,
+    key: String,
+    projected: bool,
+}
+impl Dependency {
+    pub(crate) fn capture(
+        ws: &Workspace,
+        shapes: &BTreeMap<String, Option<CommandShape>>,
+        inert: &BTreeSet<String>,
+    ) -> Vec<Self> {
+        ws.documents
+            .weak_revisions()
+            .into_iter()
+            .map(|(uri, revision)| {
+                let doc = &ws.documents[&uri];
+                let projected = canonical(doc, shapes, inert);
+                Self {
+                    uri,
+                    revision,
+                    kind: doc.kind,
+                    hint: doc.kind_hint,
+                    projected: projected.is_some(),
+                    key: projected.unwrap_or_else(|| doc.text.source.clone()),
+                }
+            })
+            .collect()
+    }
+    pub(crate) fn bytes(&self) -> usize {
+        self.key.capacity() + self.uri.as_str().len() + std::mem::size_of::<Self>()
+    }
+    pub(crate) fn matches(
+        &self,
+        ws: &Workspace,
+        origin: &Url,
+        shapes: &BTreeMap<String, Option<CommandShape>>,
+        inert: &BTreeSet<String>,
+    ) -> bool {
+        let Some(doc) = ws.documents.get(&self.uri) else {
+            return false;
+        };
+        if doc.kind != self.kind || doc.kind_hint != self.hint {
+            return false;
+        }
+        self.uri == *origin
+            || std::ptr::eq(self.revision.as_ptr(), doc)
+            || if self.projected {
+                canonical(doc, shapes, inert).as_ref() == Some(&self.key)
+            } else {
+                doc.text.source == self.key
+            }
+    }
+}
+
+pub(crate) fn observe_closed(ws: &Workspace) {
+    for (uri, doc) in &ws.documents {
+        if doc.version.is_none() {
+            if let Ok(path) = uri.to_file_path() {
+                crate::diagnostics::diagnostic_inputs::observe(&path);
+            }
+        }
+    }
 }
 
 impl Inputs {
@@ -57,11 +128,10 @@ impl Inputs {
                 .get(&self.origin)
                 .is_some_and(|doc| doc.text.source.len() as u64 <= ws.config.indexing.max_file_size)
             && self.documents.len() == ws.documents.len()
-            && self.documents.iter().all(|(uri, revision)| {
-                ws.documents
-                    .get(uri)
-                    .is_some_and(|doc| uri == &self.origin || std::ptr::eq(revision.as_ptr(), doc))
-            })
+            && self
+                .documents
+                .iter()
+                .all(|dependency| dependency.matches(ws, &self.origin, &self.shapes, &self.inert))
             && ws
                 .documents
                 .get(&self.origin)
@@ -73,9 +143,22 @@ impl Inputs {
 
 impl Prepared {
     pub(crate) fn valid_for(&self, ws: &Workspace, epoch: u64) -> bool {
-        self.inputs.matches(ws, epoch)
+        self.inputs.matches(ws, epoch) && self.files.current_for_editor(ws)
     }
     pub(crate) fn build(ws: &Workspace, origin: &Url, epoch: u64) -> Option<Self> {
+        let (prepared, files) = Files::capture(|| {
+            crate::analysis::AnalysisContext::new().run(|_| {
+                observe_closed(ws);
+                Self::build_inner(ws, origin, epoch)
+            })
+        });
+        let mut prepared = prepared?;
+        prepared.bytes += files.bytes;
+        prepared.files = files;
+        (prepared.bytes <= MAX_ENTRY_BYTES && prepared.files.current_for_editor(ws))
+            .then_some(prepared)
+    }
+    fn build_inner(ws: &Workspace, origin: &Url, epoch: u64) -> Option<Self> {
         let doc = ws.documents.get(origin)?;
         if doc.kind != DocumentKind::Latex
             || doc.text.source.len() > MAX_SOURCE
@@ -259,7 +342,9 @@ impl Prepared {
                 (name, signature)
             })
             .collect();
-        let bytes = serde_json::to_vec(&text).ok()?.len()
+        let documents = Dependency::capture(ws, &shapes, &inert);
+        let bytes = documents.iter().map(Dependency::bytes).sum::<usize>()
+            + serde_json::to_vec(&text).ok()?.len()
             + serde_json::to_vec(&math).ok()?.len()
             + key.len()
             + signatures_bytes(&signatures)
@@ -275,7 +360,7 @@ impl Prepared {
         Some(Self {
             inputs: Inputs {
                 origin: origin.clone(),
-                documents: ws.documents.weak_revisions(),
+                documents,
                 epoch,
                 key,
                 shapes,
@@ -286,6 +371,7 @@ impl Prepared {
             math,
             signatures,
             bytes,
+            files: Arc::default(),
         })
     }
 
@@ -533,8 +619,41 @@ fn canonical_context(
 pub(crate) struct Cache {
     entries: VecDeque<Arc<Prepared>>,
     paths: VecDeque<super::path_cache::Prepared>,
+    arguments: VecDeque<super::argument_cache::Prepared>,
 }
 impl Cache {
+    pub(crate) fn covers_argument(
+        &self,
+        ws: &Workspace,
+        epoch: u64,
+        uri: &Url,
+        position: Position,
+    ) -> bool {
+        self.arguments
+            .iter()
+            .any(|entry| entry.origin == *uri && entry.complete(ws, epoch, position).is_some())
+    }
+    pub(crate) fn insert_argument(&mut self, prepared: super::argument_cache::Prepared) {
+        if self
+            .arguments
+            .iter()
+            .any(|entry| entry.same_slot(&prepared) && entry.revision > prepared.revision)
+        {
+            return;
+        }
+        self.arguments.retain(|entry| !entry.same_slot(&prepared));
+        self.arguments.push_back(prepared);
+        while self.arguments.len() > 16
+            || self
+                .arguments
+                .iter()
+                .map(|entry| entry.bytes)
+                .sum::<usize>()
+                > MAX_BYTES
+        {
+            self.arguments.pop_front();
+        }
+    }
     pub(crate) fn covers_paths(&self, ws: &Workspace, epoch: u64, uri: &Url) -> bool {
         self.paths
             .iter()
@@ -543,7 +662,7 @@ impl Cache {
     pub(crate) fn covers(&self, ws: &Workspace, epoch: u64, uri: &Url) -> bool {
         self.entries
             .iter()
-            .any(|entry| &entry.inputs.origin == uri && entry.inputs.matches(ws, epoch))
+            .any(|entry| &entry.inputs.origin == uri && entry.valid_for(ws, epoch))
             || self.covers_paths(ws, epoch, uri)
     }
     pub(crate) fn complete(
@@ -556,8 +675,15 @@ impl Cache {
         self.entries
             .iter()
             .rev()
-            .find(|entry| &entry.inputs.origin == uri && entry.inputs.matches(ws, epoch))
+            .find(|entry| &entry.inputs.origin == uri && entry.valid_for(ws, epoch))
             .and_then(|entry| entry.complete(ws, position))
+            .or_else(|| {
+                self.arguments
+                    .iter()
+                    .rev()
+                    .filter(|entry| entry.origin == *uri)
+                    .find_map(|entry| entry.complete(ws, epoch, position))
+            })
             .or_else(|| {
                 self.paths
                     .iter()

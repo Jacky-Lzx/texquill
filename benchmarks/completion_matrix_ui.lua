@@ -115,6 +115,7 @@ local function start_typing()
   vim.api.nvim_buf_set_lines(a.buf, index, index, false, extra)
   local row = index + #head + (data.mode == "rapid" and 1 or 0)
   local col = #head[#head]
+  a.input_row = row
   local input_row = data.mode == "rapid" and index + 1 or row
   local input_col = data.mode == "rapid" and 0 or col
   vim.api.nvim_win_set_cursor(0, { input_row, input_col })
@@ -337,28 +338,35 @@ local function setup()
           }
           vim.schedule(function()
             local completion = require("completion_tools")
-            local current = completion.get_items()
-            local chosen = completion.get_selected_item()
-            local target, selection
-            for i, v in ipairs(current) do
-              if v == chosen then
-                selection = i
-              end
-              if v.label == a.case.label and v.textEdit and has(a.case.edits, v.textEdit.newText) then
-                target = i
-              end
+            local function intended(item)
+              return item and item.label == a.case.label and item.textEdit and has(a.case.edits, item.textEdit.newText)
             end
-            if not target then
+            local current = completion.get_items()
+            if not vim.iter(current):any(intended) then
               a.busy = false
               return
             end
-            if target ~= (selection or 0) then
-              completion.select_next({ count = target - (selection or 0) })
+            -- Async provider updates can change ordering between the rendered
+            -- frame and this scheduled callback. Check the actual selection.
+            for _ = 1, #current + 1 do
+              if intended(completion.get_selected_item()) then
+                break
+              end
+              if not completion.select_next({ count = 1 }) then
+                break
+              end
             end
+            local chosen = completion.get_selected_item()
+            if not intended(chosen) then
+              a.busy = false
+              return
+            end
+            record.selected = { label = chosen.label, new_text = chosen.textEdit.newText }
             record.accepted = completion.accept()
             vim.defer_fn(function()
-              record.line = vim.api.nvim_get_current_line()
-              record.ok = record.accepted and has(a.case.lines, record.line)
+              record.line = vim.api.nvim_buf_get_lines(a.buf, a.input_row - 1, a.input_row, false)[1]
+              record.cursor = vim.api.nvim_win_get_cursor(0)
+              record.ok = record.accepted and has(a.case.lines, record.line) and record.cursor[1] == a.input_row
               case_done(record)
             end, 50)
           end)
