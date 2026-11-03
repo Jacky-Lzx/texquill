@@ -93,6 +93,24 @@ impl Documents {
             })
     }
 
+    /// Retain the ordered editor inputs of an interactive query while taking
+    /// closed-file observations from a completed filesystem refresh.
+    pub(crate) fn overlay_open(&mut self, before: &Self) -> std::collections::BTreeSet<Url> {
+        let mut changed = std::collections::BTreeSet::new();
+        for (uri, doc) in &before.0 {
+            if doc.version.is_some()
+                && !self
+                    .0
+                    .get(uri)
+                    .is_some_and(|current| Arc::ptr_eq(current, doc))
+            {
+                self.0.insert(uri.clone(), doc.clone());
+                changed.insert(uri.clone());
+            }
+        }
+        changed
+    }
+
     pub(crate) fn updates_since(&self, before: &Self) -> Updates {
         let mut changes = Vec::new();
         for uri in self

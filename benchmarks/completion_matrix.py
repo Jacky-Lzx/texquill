@@ -68,14 +68,14 @@ CASES = [
     case("citation", r"\cite{codex", "codex2026", ["codex2026"], [r"\cite{codex2026}"]),
     case(
         "graphics",
-        r"\includegraphics{figures/codex-",
+        r"\includegraphics{figures/codex-f",
         "figures/codex-figure.pdf",
         ["figures/codex-figure.pdf"],
         [r"\includegraphics{figures/codex-figure.pdf}"],
     ),
     case(
         "package",
-        r"\usepackage{codex-p",
+        r"\usepackage{codex-pp",
         "codex-package.sty",
         ["codex-package"],
         [r"\usepackage{codex-package}"],

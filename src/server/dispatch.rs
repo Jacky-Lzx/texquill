@@ -35,6 +35,7 @@ impl RequestQueue {
         let (done, next) = oneshot::channel();
         self.tail = Some(next);
         async move {
+            let _timing = crate::performance::Span::new("dispatch.wait");
             if let Some(previous) = previous {
                 let _ = previous.await;
             }

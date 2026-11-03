@@ -10,6 +10,7 @@ pub mod editing;
 mod formatting;
 pub mod language;
 pub mod parser;
+mod performance;
 mod process;
 pub mod project;
 pub mod rpc;

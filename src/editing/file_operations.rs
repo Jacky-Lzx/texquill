@@ -43,6 +43,32 @@ impl FileChanges {
         Ok(Self(paths.into_iter().collect()))
     }
 
+    /// Only passive notifications for already known regular source files can
+    /// be redundant. Directories, aliases, conditions and config need discovery.
+    pub(crate) fn unchanged_sources(&self, workspace: &Workspace) -> Option<BTreeSet<Url>> {
+        self.0
+            .iter()
+            .map(|path| {
+                if !crate::project::workspace::is_source(path)
+                    || !std::fs::symlink_metadata(path).ok()?.file_type().is_file()
+                {
+                    return None;
+                }
+                let uri = Url::from_file_path(path).ok()?;
+                let doc = workspace.documents.get(&uri)?;
+                let source = std::fs::read_to_string(path).ok()?;
+                (source == doc.text.source).then_some(uri)
+            })
+            .collect()
+    }
+
+    pub(crate) fn changes_configuration(&self) -> bool {
+        self.0.iter().any(|path| {
+            path.file_name()
+                .is_some_and(|name| name == ".texquill.json")
+        })
+    }
+
     pub fn affects(&self, uri: &Url) -> bool {
         uri.to_file_path()
             .is_ok_and(|path| self.0.iter().any(|changed| path.starts_with(changed)))
@@ -57,7 +83,12 @@ impl FileChanges {
     }
 
     fn refresh_inner(&self, workspace: &mut Workspace, verify_inputs: bool) -> BTreeSet<Url> {
-        let mut affected = workspace.refresh_paths(&self.0);
+        let mut affected = if verify_inputs {
+            self.unchanged_sources(workspace)
+        } else {
+            None
+        }
+        .unwrap_or_else(|| workspace.refresh_paths(&self.0));
         // A new file may satisfy an earlier missing input. A deleted file may
         // only remain in the previous compiler's source/recorder information.
         let invalidated: Vec<_> = workspace

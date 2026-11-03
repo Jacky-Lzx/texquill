@@ -1219,13 +1219,9 @@ impl Workspace {
         kind_hint: Option<DocumentKind>,
     ) {
         // Updating the parser role must preserve unsaved editor contents.
-        if let Some(doc) = self
-            .documents
-            .get_mut(uri)
-            .filter(|doc| doc.version.is_some())
-        {
-            if let Some(kind) = kind_hint {
-                doc.set_kind_hint(kind);
+        if let Some(doc) = self.documents.get(uri).filter(|doc| doc.version.is_some()) {
+            if let Some(kind) = kind_hint.filter(|kind| Some(*kind) != doc.kind_hint) {
+                self.documents.get_mut(uri).unwrap().set_kind_hint(kind);
             }
             return;
         }
@@ -1268,6 +1264,13 @@ impl Workspace {
             std::fs::read_to_string(path).ok()
         });
         if let Some(source) = source {
+            if self
+                .documents
+                .get(uri)
+                .is_some_and(|doc| doc.text.source == source && doc.kind_hint == kind_hint)
+            {
+                return;
+            }
             self.documents.insert(
                 uri.clone(),
                 Document::new_with_kind(uri, source, None, kind_hint),

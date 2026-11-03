@@ -177,9 +177,7 @@ run_case = function(index)
     if lines[#lines] == "" then
       table.remove(lines)
     end
-    if
-      data.churn_buffers or not vim.deep_equal(vim.api.nvim_buf_get_lines(buf, 0, -1, false), lines)
-    then
+    if data.churn_buffers or not vim.deep_equal(vim.api.nvim_buf_get_lines(buf, 0, -1, false), lines) then
       vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
     end
   end
@@ -245,6 +243,32 @@ local function setup()
     vim.defer_fn(setup, 100)
     return
   end
+  local notify_user = vim.notify
+  vim.notify = function(message, level, opts)
+    events[#events + 1] = { method = "editorMessage", message = tostring(message), case = active and active.case.name }
+    return notify_user(message, level, opts)
+  end
+  local request = client.request
+  client.request = function(...)
+    local args = { ... }
+    local shift = args[1] == client and 1 or 0
+    local method, callback = args[1 + shift], args[3 + shift]
+    if method == "textDocument/completion" and callback then
+      local started, name = now(), active and active.case.name
+      args[3 + shift] = function(err, result, ...)
+        events[#events + 1] = {
+          method = "completionResponse",
+          case = name,
+          ms = now() - started,
+          error = err,
+          count = result and result ~= vim.NIL and #(result.items or result) or 0,
+          position = args[2 + shift].position,
+        }
+        return callback(err, result, ...)
+      end
+    end
+    return request(unpack(args))
+  end
   local notify = client.notify
   client.notify = function(...)
     local self, method, params = ...
@@ -279,13 +303,7 @@ local function setup()
     local t = now()
     local result = original(items, selected, ctx, config)
     local a = active
-    if
-      not a
-      or not a.last
-      or a.busy
-      or a.done
-      or ctx.before:sub(-#a.case.prefix) ~= a.case.prefix
-    then
+    if not a or not a.last or a.busy or a.done or ctx.before:sub(-#a.case.prefix) ~= a.case.prefix then
       return result
     end
     if a.case.tail == "\\)" and ctx.line:sub(-2) ~= "\\)" then
@@ -326,11 +344,7 @@ local function setup()
               if v == chosen then
                 selection = i
               end
-              if
-                v.label == a.case.label
-                and v.textEdit
-                and has(a.case.edits, v.textEdit.newText)
-              then
+              if v.label == a.case.label and v.textEdit and has(a.case.edits, v.textEdit.newText) then
                 target = i
               end
             end

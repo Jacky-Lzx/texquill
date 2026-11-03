@@ -87,6 +87,11 @@ impl Queries {
         background: bool,
         work: impl FnOnce(&crate::analysis::AnalysisContext) -> Result<T> + Send + 'static,
     ) -> Result<T> {
+        let waiting = crate::performance::Span::new(if background {
+            "worker.background.wait"
+        } else {
+            "worker.interactive.wait"
+        });
         // Acquire this first: queued background jobs must not take places in
         // the interactive semaphore's FIFO ahead of a completion request.
         let background = if background {
@@ -106,6 +111,7 @@ impl Queries {
             .acquire_owned()
             .await
             .map_err(|_| Error::request_cancelled())?;
+        drop(waiting);
         let request = Arc::new(AtomicBool::new(false));
         let _cancel = CancelOnDrop(request.clone());
         let cancellation = Cancellation {
@@ -119,6 +125,7 @@ impl Queries {
             // Cancelling the async waiter cannot release either permit while
             // its synchronous analysis is still using worker capacity.
             let (_background, _permit, _active) = (background, permit, active);
+            let _timing = crate::performance::Span::new("worker.compute");
             cancellation.check()?;
             let signal = cancellation.clone();
             let result =

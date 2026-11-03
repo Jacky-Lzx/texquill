@@ -914,3 +914,21 @@ Interaction report published. Ordinary definitions, relative label definitions, 
 The optimized version of the final freeze verification passes: 322 targets, 3421 passes, 0 failures, 507 default skips, of which the full serial stdio is 414 passes, 29 default skips. 109 projects including native hooks, strict full-target Clippy, documentation, format and difference checks passed; 481 Rust source code collections and hashes are consistent with the frozen list. Seven sets of actual optimized versions release/native review passed, precise navigation, completion and common reference actual editing to maintain events and complete AUX; the release SHA of the two versions is consistent with the original report.
 
 After the final verification, the dev product of this package was cleaned up, 9.4 GiB was released, and the available disk space was restored to about 20 GiB; the release baseline, dependencies, and all original measurement data were retained.
+
+### Opt-in server stage timings
+
+Set `TEXQUILL_PROFILE` to an absolute JSONL output path before launching the
+server (or the disposable Neovim matrix runner). Each record contains a stage,
+elapsed microseconds, and a wall-clock finish timestamp. No source text or
+project paths are recorded. Profiling is disabled when the variable is unset.
+
+Stages distinguish ordered dispatch, file-event observation waits, snapshot
+capture, worker queue waits, dependency propagation, completion computation,
+and file refresh/build cancellation. A completion handler's total starts after
+ordered dispatch; include `dispatch.wait` when investigating editor latency.
+
+```sh
+TEXQUILL_PROFILE="$PWD/target/performance/completion-stages.jsonl" \
+  python3 benchmarks/completion_matrix_ui.py /path/to/paper \
+  --modes save --cases reference citation environment
+```

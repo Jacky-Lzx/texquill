@@ -75,6 +75,7 @@ pub struct Backend {
     shutdown_requested: AtomicBool,
     pending_change_publish: Arc<AtomicBool>,
     completion: super::completion::Completion,
+    file_refreshes: super::files::Refreshes,
     semantic_cache: Mutex<semantic_cache::Cache>,
     diagnostic_cache: Arc<Mutex<diagnostic::Cache>>,
 }
@@ -98,6 +99,7 @@ impl Backend {
             shutdown_requested: AtomicBool::new(false),
             pending_change_publish: Arc::new(AtomicBool::new(false)),
             completion: Default::default(),
+            file_refreshes: Default::default(),
             semantic_cache: Mutex::new(semantic_cache::Cache::default()),
             diagnostic_cache: Arc::new(Mutex::new(diagnostic::Cache::default())),
         }
@@ -146,7 +148,9 @@ impl Backend {
         &self,
         query: impl FnOnce(&Workspace) -> T + Send + 'static,
     ) -> Result<T> {
-        let (workspace, epoch, revision) = {
+        let files = self.file_refreshes.pending();
+        let (mut workspace, mut epoch, mut revision) = {
+            let _timing = crate::performance::Span::new("query.snapshot");
             let inputs = self.workspace.read_unindexed().await;
             (
                 inputs.clone(),
@@ -154,6 +158,19 @@ impl Backend {
                 self.workspace.revision(),
             )
         };
+        if let Some(ticket) = files {
+            dispatch::release();
+            let _timing = crate::performance::Span::new("query.file_events");
+            self.file_refreshes.wait(ticket).await;
+            let current = self.workspace.read_unindexed().await;
+            let mut refreshed = current.clone();
+            refreshed
+                .pending_dependencies
+                .extend(refreshed.documents.overlay_open(&workspace.documents));
+            workspace = refreshed;
+            epoch = self.workspace.completion_epoch();
+            revision = self.workspace.revision();
+        }
         let analysis = self.queries.analyses.clone();
         dispatch::release();
         self.queries
@@ -166,6 +183,7 @@ impl Backend {
                         revision,
                         analysis.clone(),
                     );
+                    let _timing = crate::performance::Span::new("query.dependencies");
                     context.run(|_| workspace.refresh_pending_dependencies());
                 }
                 Ok(crate::analysis::AnalysisContext::for_workspace(
@@ -228,6 +246,7 @@ impl Backend {
         &self,
         query: impl FnOnce(&Workspace) -> Result<T> + Clone + Send + 'static,
     ) -> Result<T> {
+        self.wait_file_events().await?;
         let (mut workspace, mut revision) = {
             let workspace = self.workspace.read().await;
             (workspace.clone(), self.workspace.revision())
@@ -461,7 +480,21 @@ impl Backend {
         );
     }
 
+    async fn wait_file_events(&self) -> Result<()> {
+        if let Some(ticket) = self.file_refreshes.pending() {
+            let source = self.workspace.source_revision();
+            dispatch::release();
+            let _timing = crate::performance::Span::new("query.file_events");
+            self.file_refreshes.wait(ticket).await;
+            if source != self.workspace.source_revision() {
+                return Err(content_modified());
+            }
+        }
+        Ok(())
+    }
+
     async fn wait_prepared_inputs(&self) -> Result<()> {
+        self.wait_file_events().await?;
         let source = self.workspace.source_revision();
         loop {
             let changed = self.workspace.update_signal();
@@ -615,20 +648,70 @@ impl Backend {
                 return;
             }
         };
+        let _timing = crate::performance::Span::new("files.total");
+        let ticket = self.file_refreshes.begin();
+        // Reserve the observation in wire order before allowing edits and
+        // queries to proceed. Queries that need these files await its ticket.
+        dispatch::release();
+        ticket.previous().await;
+        let build_timing = crate::performance::Span::new("files.build_cancellation");
         let watched_builds = if from_watcher {
             self.builds.watched_files_changed(&changes).await
         } else {
             self.builds.files_changed(&changes).await;
             Default::default()
         };
-        let affected = {
-            let mut workspace = self.workspace.write().await;
-            if from_watcher {
-                changes.refresh_watched(&mut workspace)
-            } else {
-                changes.refresh(&mut workspace)
+        drop(build_timing);
+        let changes = Arc::new(changes);
+        let affected = loop {
+            let (snapshot, source, epoch, revision) = {
+                let inputs = self.workspace.read_unindexed().await;
+                (
+                    inputs.clone(),
+                    self.workspace.source_revision(),
+                    self.workspace.completion_epoch(),
+                    self.workspace.revision(),
+                )
+            };
+            let events = changes.clone();
+            let inputs = self.workspace.clone();
+            let analyses = self.queries.analyses.clone();
+            let prepared = self
+                .queries
+                .run_background(move |_| {
+                    let _timing = crate::performance::Span::new("files.refresh");
+                    let context = crate::analysis::AnalysisContext::cancellable(move || {
+                        inputs.source_revision() != source
+                    });
+                    context.run(|context| {
+                        context.check()?;
+                        let prepared = crate::analysis::AnalysisContext::for_workspace(
+                            &snapshot, epoch, revision, analyses,
+                        )
+                        .run(|_| super::files::Prepared::build(snapshot, &events, from_watcher));
+                        context.check()?;
+                        Ok(prepared)
+                    })
+                })
+                .await;
+            let prepared = match prepared {
+                Ok(prepared) => prepared,
+                Err(_) if self.workspace.source_revision() != source => continue,
+                Err(_) => return,
+            };
+            let mut workspace = self.workspace.write_prepared().await;
+            if self.workspace.source_revision() != source || !prepared.current(&workspace) {
+                continue;
             }
+            let affected = prepared.affected.clone();
+            let changed = prepared.merge(&mut workspace);
+            if changed || changes.changes_configuration() {
+                self.workspace.invalidate_completion();
+            }
+            break affected;
         };
+        self.builds.resume_watched(watched_builds).await;
+        drop(ticket);
         {
             let mut cache = self.semantic_cache.lock().await;
             for uri in &affected {
@@ -644,7 +727,7 @@ impl Backend {
         // Revalidate cached analysis after a watcher event, preserving result
         // IDs when a delayed notification changes neither payload nor version.
         self.publish_affected(affected).await;
-        self.builds.resume_watched(watched_builds).await;
+        self.prepare_completion();
     }
 }
 
@@ -1154,6 +1237,10 @@ impl Backend {
         &self,
         params: ExecuteCommandParams,
     ) -> Result<Option<serde_json::Value>> {
+        if params.command != "latex.cancelBuild" {
+            self.wait_file_events().await?;
+        }
+
         if params.command == "latex.reindex" {
             let status = self.reindex().await?;
             self.publish_open().await;
@@ -1570,16 +1657,25 @@ impl Backend {
         &self,
         params: CompletionParams,
     ) -> Result<Option<CompletionResponse>> {
+        let _timing = crate::performance::Span::new("completion.total");
         let (prepare_path, epoch) = {
             let position = &params.text_document_position;
             let inputs = self.workspace.completion_inputs();
             let workspace = &inputs.workspace;
-            if let Some(items) = self.completion.complete(
-                workspace,
-                inputs.epoch,
-                &document_uri(position.text_document.uri.clone()),
-                position.position,
-            ) {
+            let prepared = self
+                .file_refreshes
+                .pending()
+                .is_none()
+                .then(|| {
+                    self.completion.complete(
+                        workspace,
+                        inputs.epoch,
+                        &document_uri(position.text_document.uri.clone()),
+                        position.position,
+                    )
+                })
+                .flatten();
+            if let Some(items) = prepared {
                 let limit = workspace.config.indexing.completion_limit;
                 let incomplete = items.len() >= limit;
                 let items = items.into_iter().take(limit).collect();
@@ -1610,6 +1706,7 @@ impl Backend {
         );
         let completion = self.completion.clone();
         self.read_query(move |workspace| {
+            let _timing = crate::performance::Span::new("completion.compute");
             let position = params.text_document_position;
             let uri = document_uri(position.text_document.uri);
             let mut items = if prepare_path {
@@ -2039,6 +2136,141 @@ mod read_query_tests {
         .await
         .unwrap();
         position
+    }
+
+    #[tokio::test]
+    async fn interactive_file_wait_keeps_ordered_editor_positions_and_observes_new_disk_inputs() {
+        let (client, _outgoing) = Client::new();
+        let backend = Arc::new(Backend::new(client));
+        let uri = Url::parse("untitled:query.tex").unwrap();
+        let disk = Url::parse("untitled:disk.tex").unwrap();
+        {
+            let mut workspace = backend.workspace.write().await;
+            workspace.documents.insert(
+                uri.clone(),
+                workspace::Document::new(&uri, "Old editor".into(), Some(1)),
+            );
+            workspace.documents.insert(
+                disk.clone(),
+                workspace::Document::new(&disk, "Old disk".into(), None),
+            );
+        }
+        let ticket = backend.file_refreshes.begin();
+        let reader = backend.clone();
+        let open = uri.clone();
+        let query = tokio::spawn(async move {
+            reader
+                .read_query(move |ws| {
+                    (
+                        ws.documents[&open].text.source.clone(),
+                        ws.documents[&disk].text.source.clone(),
+                    )
+                })
+                .await
+        });
+        tokio::task::yield_now().await;
+        {
+            let mut workspace = backend.workspace.write_changes().await;
+            workspace.documents.insert(
+                uri.clone(),
+                workspace::Document::new(&uri, "New editor".into(), Some(2)),
+            );
+            let disk = Url::parse("untitled:disk.tex").unwrap();
+            workspace.documents.insert(
+                disk.clone(),
+                workspace::Document::new(&disk, "New disk".into(), None),
+            );
+        }
+        drop(ticket);
+        assert_eq!(
+            query.await.unwrap().unwrap(),
+            ("Old editor".into(), "New disk".into())
+        );
+        assert_eq!(
+            backend.workspace.read_unindexed().await.documents[&uri]
+                .text
+                .source,
+            "New editor"
+        );
+    }
+
+    #[tokio::test]
+    async fn file_refresh_releases_ordered_edits_and_queries_wait_for_the_observation() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = Url::from_file_path(dir.path().join("main.tex")).unwrap();
+        std::fs::write(uri.to_file_path().unwrap(), "Saved").unwrap();
+        let (client, mut outgoing) = Client::new();
+        tokio::spawn(async move { while outgoing.recv().await.is_some() {} });
+        let backend = Arc::new(Backend::new(client));
+        {
+            let mut workspace = backend.workspace.write().await;
+            workspace.diagnostic_delivery = diagnostic::Delivery::new(true, true);
+            workspace.open(uri.clone(), "Saved".into(), 1);
+        }
+        let mut workers = Vec::new();
+        let mut finishes = Vec::new();
+        for _ in 0..4 {
+            let queries = backend.queries.clone();
+            let (started, start) = oneshot::channel();
+            let (finish, finished) = oneshot::channel();
+            workers.push(tokio::spawn(async move {
+                queries
+                    .run(move |_| {
+                        started.send(()).unwrap();
+                        finished.blocking_recv().unwrap();
+                        Ok(())
+                    })
+                    .await
+                    .unwrap();
+            }));
+            start.await.unwrap();
+            finishes.push(finish);
+        }
+        let mut queue = dispatch::RequestQueue::default();
+        let first = backend.clone();
+        let changed = uri.clone();
+        let notification = queue.ordered(async move {
+            first
+                .refresh_file_events(file_operations::FileChanges::new([changed.as_str()]), true)
+                .await;
+        });
+        let notification = tokio::spawn(notification);
+        let second = backend.clone();
+        let changed = uri.clone();
+        let edit = queue.ordered(async move {
+            let mut workspace = second.workspace.write_changes().await;
+            workspace.documents.insert(
+                changed.clone(),
+                workspace::Document::new(&changed, "Unsaved".into(), Some(2)),
+            );
+            workspace.defer_dependencies(changed);
+        });
+        tokio::time::timeout(Duration::from_secs(1), edit)
+            .await
+            .unwrap();
+        assert!(backend.file_refreshes.pending().is_some());
+        let reader = backend.clone();
+        let changed = uri.clone();
+        let mut query = tokio::spawn(async move {
+            reader
+                .read_query(move |ws| ws.documents[&changed].text.source.clone())
+                .await
+        });
+        assert!(tokio::time::timeout(Duration::from_millis(20), &mut query)
+            .await
+            .is_err());
+        for finish in finishes {
+            finish.send(()).unwrap();
+        }
+        for worker in workers {
+            worker.await.unwrap();
+        }
+        notification.await.unwrap();
+        assert_eq!(query.await.unwrap().unwrap(), "Unsaved");
+        assert_eq!(
+            backend.workspace.read_unindexed().await.documents[&uri].version,
+            Some(2)
+        );
     }
 
     #[tokio::test]
