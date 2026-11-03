@@ -82,6 +82,8 @@ pub struct WorkspaceStore {
     completion_epoch: Arc<AtomicU64>,
     source_revision: Arc<AtomicU64>,
     completion_inputs: Arc<std::sync::RwLock<Arc<CompletionInputs>>>,
+    file_inputs: Arc<std::sync::RwLock<Option<Arc<super::file_inputs::Observed>>>>,
+    saved: Arc<std::sync::Mutex<super::file_inputs::Saved>>,
 }
 
 /// Count notifications from receipt until their ordered handler completes,
@@ -107,7 +109,33 @@ impl WorkspaceStore {
             queued_changes: Arc::default(),
             completion_epoch: Arc::default(),
             source_revision: Arc::default(),
+            file_inputs: Arc::default(),
+            saved: Arc::default(),
         }
+    }
+
+    pub(crate) fn remember_save(&self, uri: lsp_types::Url, doc: &super::workspace::Document) {
+        self.saved.lock().unwrap().remember(uri, doc);
+    }
+    pub(crate) fn saved_inputs(&self) -> super::file_inputs::Saved {
+        self.saved.lock().unwrap().clone()
+    }
+    pub(crate) fn record_file_inputs(
+        &self,
+        workspace: &Workspace,
+        files: Arc<crate::diagnostics::diagnostic_inputs::Files>,
+    ) {
+        let next = Arc::new(super::file_inputs::Observed::new(
+            workspace,
+            self.completion_epoch(),
+            files,
+        ));
+        let old = self.file_inputs.write().unwrap().replace(next);
+        drop(old);
+    }
+    pub(crate) fn file_inputs_unchanged(&self, workspace: &Workspace, epoch: u64) -> bool {
+        let inputs = self.file_inputs.read().unwrap().clone();
+        inputs.is_some_and(|inputs| inputs.current(workspace, epoch))
     }
 
     pub async fn read(&self) -> RwLockReadGuard<'_, Workspace> {

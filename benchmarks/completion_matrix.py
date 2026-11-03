@@ -32,6 +32,14 @@ def case(name, prefix, label, edits, lines, **extra):
 
 
 CASES = [
+    case("input", r"\inp", "input", ["input{${1:file}}"], [r"\input{file}"]),
+    case(
+        "input_path",
+        r"\input{Tex/0_Abs",
+        "Tex/0_Abstract.tex",
+        ["Tex/0_Abstract", "Tex/0_Abstract.tex"],
+        [r"\input{Tex/0_Abstract}", r"\input{Tex/0_Abstract.tex}"],
+    ),
     case(
         "section",
         r"\sec",

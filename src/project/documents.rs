@@ -16,6 +16,18 @@ pub struct Documents(BTreeMap<Url, Arc<Document>>);
 pub(crate) struct Revisions(Vec<(Url, Weak<Document>)>);
 
 impl Revisions {
+    pub(crate) fn current_except(
+        &self,
+        documents: &Documents,
+        pending: &std::collections::BTreeSet<Url>,
+    ) -> bool {
+        self.0.len() == documents.len()
+            && self.0.iter().all(|(uri, revision)| {
+                documents.0.get(uri).is_some_and(|doc| {
+                    pending.contains(uri) || revision.as_ptr() == Arc::as_ptr(doc)
+                })
+            })
+    }
     pub(crate) fn current(&self, documents: &Documents) -> bool {
         self.0.len() == documents.len()
             && self.0.iter().all(|(uri, revision)| {

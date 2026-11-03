@@ -18,6 +18,7 @@ use std::{
 pub struct Renames(Vec<(PathBuf, PathBuf)>);
 
 /// Filesystem notifications can name a directory without listing its children.
+#[derive(Clone, Default)]
 pub struct FileChanges(Vec<PathBuf>);
 
 impl FileChanges {
@@ -43,9 +44,30 @@ impl FileChanges {
         Ok(Self(paths.into_iter().collect()))
     }
 
+    pub(crate) fn extend(&mut self, other: Self) {
+        self.0.extend(other.0);
+        self.0.sort();
+        self.0.dedup();
+    }
+    pub(crate) fn affected_documents(&self, workspace: &Workspace) -> BTreeSet<Url> {
+        workspace
+            .documents
+            .keys()
+            .filter(|uri| self.affects(uri))
+            .cloned()
+            .collect()
+    }
+
     /// Only passive notifications for already known regular source files can
     /// be redundant. Directories, aliases, conditions and config need discovery.
     pub(crate) fn unchanged_sources(&self, workspace: &Workspace) -> Option<BTreeSet<Url>> {
+        self.unchanged_saved_sources(workspace, &Default::default())
+    }
+    pub(crate) fn unchanged_saved_sources(
+        &self,
+        workspace: &Workspace,
+        saved: &crate::project::file_inputs::Saved,
+    ) -> Option<BTreeSet<Url>> {
         self.0
             .iter()
             .map(|path| {
@@ -57,7 +79,10 @@ impl FileChanges {
                 let uri = Url::from_file_path(path).ok()?;
                 let doc = workspace.documents.get(&uri)?;
                 let source = std::fs::read_to_string(path).ok()?;
-                (source == doc.text.source).then_some(uri)
+                (source == doc.text.source
+                    || path.canonicalize().ok().as_ref() == Some(path)
+                        && saved.matches(&uri, doc, &source))
+                .then_some(uri)
             })
             .collect()
     }
@@ -86,20 +111,33 @@ impl FileChanges {
     }
 
     pub fn refresh(&self, workspace: &mut Workspace) -> BTreeSet<Url> {
-        self.refresh_inner(workspace, false)
+        self.refresh_inner(workspace, false, false)
     }
 
-    pub(crate) fn refresh_watched(&self, workspace: &mut Workspace) -> BTreeSet<Url> {
-        self.refresh_inner(workspace, true)
+    pub(crate) fn refresh_observed(
+        &self,
+        workspace: &mut Workspace,
+        watched: bool,
+        graph_unchanged: bool,
+    ) -> BTreeSet<Url> {
+        self.refresh_inner(workspace, watched, graph_unchanged)
     }
-
-    fn refresh_inner(&self, workspace: &mut Workspace, verify_inputs: bool) -> BTreeSet<Url> {
-        let mut affected = if verify_inputs {
-            self.unchanged_sources(workspace)
+    fn refresh_inner(
+        &self,
+        workspace: &mut Workspace,
+        verify_inputs: bool,
+        graph_unchanged: bool,
+    ) -> BTreeSet<Url> {
+        let mut affected = if graph_unchanged {
+            self.affected_documents(workspace)
         } else {
-            None
-        }
-        .unwrap_or_else(|| workspace.refresh_paths(&self.0));
+            if verify_inputs {
+                self.unchanged_sources(workspace)
+            } else {
+                None
+            }
+            .unwrap_or_else(|| workspace.refresh_paths(&self.0))
+        };
         // A new file may satisfy an earlier missing input. A deleted file may
         // only remain in the previous compiler's source/recorder information.
         let invalidated: Vec<_> = workspace
@@ -128,8 +166,16 @@ impl FileChanges {
                             checks.watched().iter().any(|uri| self.affects(uri))
                                 && checks.changed_path().is_some()
                         })
+                    || workspace
+                        .project
+                        .build_checks
+                        .get(*root)
+                        .is_some_and(|checks| {
+                            checks.changed_matching_input(|uri| self.affects(uri))
+                        })
                     || diagnostics.keys().any(&mut changed)
-                    || workspace.project_files(root).iter().any(&mut changed)
+                    || (!graph_unchanged || !workspace.project.build_checks.contains_key(*root))
+                        && workspace.project_files(root).iter().any(&mut changed)
                     || workspace
                         .project_bindings(root)
                         .filter_map(|(_, target)| Url::from_file_path(target).ok())

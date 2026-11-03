@@ -632,6 +632,14 @@ impl Snapshot {
         updated
     }
 
+    /// Compare the inputs of this published build, independently of which
+    /// revision a different root most recently loaded into the workspace.
+    pub(crate) fn changed_matching_input(&self, affects: impl Fn(&Url) -> bool) -> bool {
+        self.inputs
+            .iter()
+            .any(|(uri, before)| affects(uri) && before.changed(uri))
+    }
+
     pub(crate) fn input_changed(&self, uri: &Url) -> bool {
         // Unknown inputs invalidate conservatively, including newly resolved
         // dependencies and histories evicted by the root limit.

@@ -160,27 +160,40 @@ impl Completion {
                         return Err(crate::rpc::Error::request_cancelled());
                     }
                     analysis.command_candidates().prepare(&snapshot);
-                    let changed = if snapshot.has_pending_dependencies() {
-                        let updates = crate::analysis::AnalysisContext::for_workspace(
-                            &snapshot,
-                            epoch,
-                            revision,
-                            analysis.clone(),
-                        );
-                        let inputs = source_inputs.clone();
-                        crate::analysis::AnalysisContext::cancellable(move || {
-                            inputs.source_revision() != source_revision
-                                || inputs.completion_epoch() != epoch
-                        })
-                        .run(|context| {
-                            context.check()?;
-                            let changed = updates.run(|_| snapshot.refresh_pending_dependencies());
-                            context.check()?;
-                            Ok(changed)
-                        })?
-                    } else {
-                        false
-                    };
+                    let (changed, files) =
+                        crate::diagnostics::diagnostic_inputs::Files::capture(|| {
+                            let changed = if snapshot.has_pending_dependencies() {
+                                let updates = crate::analysis::AnalysisContext::for_workspace(
+                                    &snapshot,
+                                    epoch,
+                                    revision,
+                                    analysis.clone(),
+                                );
+                                let inputs = source_inputs.clone();
+                                crate::analysis::AnalysisContext::cancellable(move || {
+                                    inputs.source_revision() != source_revision
+                                        || inputs.completion_epoch() != epoch
+                                })
+                                .run(|context| {
+                                    context.check()?;
+                                    let changed =
+                                        updates.run(|_| snapshot.refresh_pending_dependencies());
+                                    context.check()?;
+                                    Ok(changed)
+                                })?
+                            } else {
+                                false
+                            };
+                            crate::analysis::AnalysisContext::for_workspace(
+                                &snapshot,
+                                epoch,
+                                revision,
+                                analysis.clone(),
+                            )
+                            .run(|_| crate::project::file_inputs::observe_graph(&snapshot));
+                            Ok::<_, crate::rpc::Error>(changed)
+                        });
+                    let changed = changed?;
                     // Candidate preparation for an already propagated snapshot
                     // may survive ordinary typing. Its canonical-input proof is
                     // checked against the current text before insertion below.
@@ -234,7 +247,7 @@ impl Completion {
                     }
                     context.check()?;
                     cancel.check()?;
-                    Ok((snapshot, changed, prepared, paths, arguments))
+                    Ok((snapshot, changed, prepared, paths, arguments, files))
                 })
             };
             // A native input request needs its certificate during typing.
@@ -254,7 +267,7 @@ impl Completion {
             };
             let mut retry;
             let observed;
-            if let Ok((snapshot, changed, prepared, paths, arguments)) = result {
+            if let Ok((snapshot, changed, prepared, paths, arguments, files)) = result {
                 let delivery = snapshot.diagnostic_delivery.clone();
                 let mut inputs = workspace.write_prepared().await;
                 let current = workspace.source_revision() == source_revision
@@ -266,6 +279,9 @@ impl Completion {
                     inputs.documents = snapshot.documents;
                     inputs.pending_dependencies = snapshot.pending_dependencies;
                     inputs.index_truncated = snapshot.index_truncated;
+                }
+                if current {
+                    workspace.record_file_inputs(&inputs, files);
                 }
                 for entry in prepared {
                     if entry.valid_for(&inputs, workspace.completion_epoch()) {

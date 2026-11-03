@@ -126,6 +126,7 @@ text formatting, list items, fractions/Greek symbols, environment names,
 reference/citation keys, image paths, local packages, macro definitions and
 user macros. It includes immediate/paused requests after changing a macro from
 two parameters to one, plus completion in the abstract and introduction buffers.
+Baseline cases also accept `\input` and a braced source filename.
 The fixture expects the paper layout `main.tex`, `ref.bib`,
 `Tex/0_Abstract.tex`, `Tex/1_Introduction.tex` and a `\maketitle` anchor. All
 fixture additions and edits stay in temporary copies. Local class definitions
@@ -951,3 +952,44 @@ memory limits retain the semantic provider. Environment arguments and graphics
 paths retain their contextual providers. File events that may introduce a new
 source or directory wait for discovery; unrelated events can reuse candidates
 whose disk observations still validate.
+
+Watcher refreshes also retain a separate source-graph observation, including
+closed documents and failed dependency lookups. A mixed save notification such
+as `main.tex`, `4913`, and `main.tex~` can reuse this graph when its observed
+inputs still validate. These names are not ignored: a referenced backup file
+or a newly satisfied conditional input still triggers discovery. A bounded
+last-save snapshot recognizes delayed saves even after further editor typing;
+it retains at most 64 documents, 1 MiB of source text per document and 8 MiB of
+source text in total.
+
+Queued watcher notifications coalesce into deduplicated refresh batches without
+delaying the first notification or crossing an explicit file operation. Cold
+interactive queries bypass a pending batch only when their observed graph is
+unchanged and no new source/configuration discovery is pending. Build
+diagnostics remain checked against each root's published compilation inputs.
+
+The additional opt-in stages `files.graph_reused` and `files.graph_refresh`
+distinguish graph reuse from discovery. Profile both server work and actual
+Neovim acceptance: filesystem observers, cold dependency changes, and client
+scheduling can still add latency outside a prepared candidate lookup.
+
+On 2026-11-03, sequential real-Neovim save/build runs against disposable copies
+of the DAC 2027 IEEEtran project compared release SHA-256
+`73fe61917e8d298528014a01d9a5c77986773a857d112a1337e9820f71df8ece`
+with `27aa500cd62a0265d5dd70833515a084fdbf0302b767fc97e52aa5d8200ca8cc`.
+All eight selected completions were accepted correctly. Menu latency changed
+from 1444 to 212 ms for environments, 1542 to 263 ms for references, 691 to
+412 ms for citations, 1771 to 500 ms for graphics and 608 to 238 ms for an
+immediately edited macro. The remaining three command samples were 5–24 ms.
+These are individual samples, not latency bounds. Stage timings are separate
+measurements and must not be added to explain a particular menu sample:
+maximum file-refresh work changed from 1257 to 34 ms, and maximum file-event
+query wait from 2004 to 303 ms. The new run reused its graph in 20 of 21 batches.
+
+```sh
+TEXQUILL_PROFILE="$PWD/target/performance/save-events.jsonl" \
+  python3 benchmarks/completion_matrix_ui.py /path/to/paper \
+  --server /path/to/frozen/texquill --modes save \
+  --cases section subsection textbf environment reference citation graphics macro_immediate \
+  --output target/performance/save-events-ui
+```

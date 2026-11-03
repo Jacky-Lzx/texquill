@@ -4,6 +4,7 @@ pub mod catalog;
 pub(crate) mod code_inputs;
 pub mod distribution;
 pub mod documents;
+pub(crate) mod file_inputs;
 pub mod graphics;
 pub(crate) mod graphics_settings;
 pub(crate) mod imports;

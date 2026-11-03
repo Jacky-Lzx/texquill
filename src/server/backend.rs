@@ -148,7 +148,7 @@ impl Backend {
         &self,
         query: impl FnOnce(&Workspace) -> T + Send + 'static,
     ) -> Result<T> {
-        let files = self.file_refreshes.pending();
+        let pending_files = self.file_refreshes.pending();
         let (mut workspace, mut epoch, mut revision) = {
             let _timing = crate::performance::Span::new("query.snapshot");
             let inputs = self.workspace.read_unindexed().await;
@@ -158,6 +158,10 @@ impl Backend {
                 self.workspace.revision(),
             )
         };
+        let files = pending_files.filter(|_| {
+            self.file_refreshes.source_set_pending()
+                || !self.workspace.file_inputs_unchanged(&workspace, epoch)
+        });
         if let Some(ticket) = files {
             dispatch::release();
             let _timing = crate::performance::Span::new("query.file_events");
@@ -651,11 +655,17 @@ impl Backend {
         let _timing = crate::performance::Span::new("files.total");
         let changes_source_set =
             changes.changes_source_set(&*self.workspace.read_unindexed().await);
-        let ticket = self.file_refreshes.begin(changes_source_set);
-        // Reserve the observation in wire order before allowing edits and
-        // queries to proceed. Queries that need these files await its ticket.
+        let ticket = self
+            .file_refreshes
+            .queue(changes, from_watcher, changes_source_set);
+        // Reserve in wire order; one owner prepares a deduplicated batch of
+        // queued watchers while followers wait for the same publication.
         dispatch::release();
-        ticket.previous().await;
+        let Some(mut batch) = ticket.batch().await else {
+            return;
+        };
+        let changes = batch.take_changes();
+        let from_watcher = batch.watched;
         let build_timing = crate::performance::Span::new("files.build_cancellation");
         let watched_builds = if from_watcher {
             self.builds.watched_files_changed(&changes).await
@@ -677,31 +687,42 @@ impl Backend {
             };
             let events = changes.clone();
             let inputs = self.workspace.clone();
+            let saved = self.workspace.saved_inputs();
             let analyses = self.queries.analyses.clone();
             let prepared = self
                 .queries
                 .run_background(move |_| {
                     let _timing = crate::performance::Span::new("files.refresh");
+                    let revisions = inputs.clone();
                     let context = crate::analysis::AnalysisContext::cancellable(move || {
-                        inputs.source_revision() != source
+                        revisions.source_revision() != source
                     });
                     context.run(|context| {
                         context.check()?;
                         // The analysis binding identifies this workspace by
                         // address; keep it in place throughout preparation.
                         let mut snapshot = snapshot;
+                        let graph_unchanged = from_watcher
+                            && !events.changes_source_set(&snapshot)
+                            && inputs.file_inputs_unchanged(&snapshot, epoch);
                         let prepared = crate::analysis::AnalysisContext::for_workspace(
                             &snapshot, epoch, revision, analyses,
                         )
                         .run(|_| {
-                            super::files::Prepared::prepare(&mut snapshot, &events, from_watcher)
+                            super::files::Prepared::prepare_observed(
+                                &mut snapshot,
+                                &events,
+                                from_watcher,
+                                graph_unchanged,
+                                &saved,
+                            )
                         });
                         context.check()?;
                         Ok(prepared)
                     })
                 })
                 .await;
-            let prepared = match prepared {
+            let mut prepared = match prepared {
                 Ok(prepared) => prepared,
                 Err(_) if self.workspace.source_revision() != source => continue,
                 Err(_) => return,
@@ -711,13 +732,18 @@ impl Backend {
                 continue;
             }
             let affected = prepared.affected.clone();
+            let files = prepared.files.take();
             let changed = prepared.merge(&mut workspace);
             if changed || changes.changes_configuration() {
                 self.workspace.invalidate_completion();
             }
+            if let Some(files) = files {
+                self.workspace.record_file_inputs(&workspace, files);
+            }
             break affected;
         };
         self.builds.resume_watched(watched_builds).await;
+        drop(batch);
         drop(ticket);
         {
             let mut cache = self.semantic_cache.lock().await;
@@ -1061,7 +1087,17 @@ impl Backend {
         let item = params.text_document;
         let origin = item.uri.clone();
         let mut workspace = self.workspace.write().await;
-        workspace.open_with_language(item.uri, item.text, item.version, &item.language_id);
+        let (_, files) = crate::diagnostics::diagnostic_inputs::Files::capture(|| {
+            workspace.open_with_language(item.uri, item.text, item.version, &item.language_id);
+            crate::analysis::AnalysisContext::for_workspace(
+                &workspace,
+                self.workspace.completion_epoch(),
+                self.workspace.revision(),
+                self.queries.analyses.clone(),
+            )
+            .run(|_| crate::project::file_inputs::observe_graph(&workspace));
+        });
+        self.workspace.record_file_inputs(&workspace, files);
         drop(workspace);
         self.publish_open().await;
         self.completion.schedule(
@@ -1165,6 +1201,12 @@ impl Backend {
                 workspace.clear_build_diagnostics(&uri);
                 workspace.defer_dependencies(uri.clone());
                 self.pending_change_publish.store(true, Ordering::SeqCst);
+            }
+        }
+        {
+            let workspace = self.workspace.read_unindexed().await;
+            if let Some(doc) = workspace.documents.get(&uri) {
+                self.workspace.remember_save(uri.clone(), doc);
             }
         }
         self.publish_open().await;
@@ -2225,6 +2267,102 @@ mod read_query_tests {
                 .source,
             "New editor"
         );
+    }
+
+    #[tokio::test]
+    async fn cold_interactive_queries_bypass_unrelated_watchers_but_wait_for_new_sources() {
+        for relevant in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().canonicalize().unwrap();
+            let uri = Url::from_file_path(root.join("main.tex")).unwrap();
+            let source = "\\documentclass{article}\n\\InputIfFileExists{late}{}{}\n";
+            std::fs::write(uri.to_file_path().unwrap(), source).unwrap();
+            let (client, mut outgoing) = Client::new();
+            tokio::spawn(async move { while outgoing.recv().await.is_some() {} });
+            let backend = Arc::new(Backend::new(client));
+            {
+                let mut workspace = backend.workspace.write().await;
+                workspace.config.distribution.enabled = false;
+                workspace.diagnostic_delivery = diagnostic::Delivery::new(true, true);
+                let (_, files) = crate::diagnostics::diagnostic_inputs::Files::capture(|| {
+                    workspace.open(uri.clone(), source.into(), 1);
+                    crate::analysis::AnalysisContext::new()
+                        .run(|_| crate::project::file_inputs::observe_graph(&workspace));
+                });
+                backend.workspace.record_file_inputs(&workspace, files);
+            }
+            let mut workers = Vec::new();
+            let mut finishes = Vec::new();
+            for _ in 0..3 {
+                let queries = backend.queries.clone();
+                let (started, start) = oneshot::channel();
+                let (finish, finished) = oneshot::channel();
+                workers.push(tokio::spawn(async move {
+                    queries
+                        .run_background(move |_| {
+                            started.send(()).unwrap();
+                            finished.blocking_recv().unwrap();
+                            Ok(())
+                        })
+                        .await
+                        .unwrap()
+                }));
+                start.await.unwrap();
+                finishes.push(finish);
+            }
+            let name = if relevant { "late.tex" } else { "4913" };
+            std::fs::write(root.join(name), "\\newcommand{\\loaded}{}").unwrap();
+            let changed = Url::from_file_path(root.join(name)).unwrap();
+            let writer = backend.clone();
+            let notification = tokio::spawn(async move {
+                writer
+                    .refresh_file_events(
+                        file_operations::FileChanges::new([changed.as_str()]),
+                        true,
+                    )
+                    .await
+            });
+            while backend.file_refreshes.pending().is_none() {
+                tokio::task::yield_now().await;
+            }
+            let reader = backend.clone();
+            let main = uri.clone();
+            let mut query = tokio::spawn(async move {
+                reader
+                    .read_query(move |ws| ws.documents[&main].text.source.clone())
+                    .await
+            });
+            if relevant {
+                assert!(tokio::time::timeout(Duration::from_millis(20), &mut query)
+                    .await
+                    .is_err());
+            } else {
+                assert_eq!(
+                    tokio::time::timeout(Duration::from_secs(1), &mut query)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .unwrap(),
+                    source
+                );
+            }
+            for finish in finishes {
+                finish.send(()).unwrap();
+            }
+            for worker in workers {
+                worker.await.unwrap();
+            }
+            notification.await.unwrap();
+            if relevant {
+                query.await.unwrap().unwrap();
+                assert!(backend
+                    .workspace
+                    .read_unindexed()
+                    .await
+                    .documents
+                    .contains_key(&uri.join("late.tex").unwrap()));
+            }
+        }
     }
 
     #[tokio::test]
