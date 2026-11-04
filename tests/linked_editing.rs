@@ -39,6 +39,51 @@ fn paired_environment_names_return_identical_utf16_ranges_from_either_end() {
 }
 
 #[test]
+fn booktabs_rules_preserve_nested_table_environment_pairs() {
+    for rule in ["toprule", "midrule", "bottomrule"] {
+        for width in ["", "[0.8pt]"] {
+            let source = format!(
+                "\\documentclass{{article}}\n\\usepackage{{booktabs}}\n\\begin{{document}}\n\\begin{{table}}[H]\n  \\centering\n  \\begin{{tabular}}{{ccc}}\n    \\toprule\n    a & b & c \\\\\n    \\midrule\n    1 & 2 & 3 \\\\\n    \\{rule}{width}\n  \\end{{tabular}}\n\\end{{table}}\n\\end{{document}}\n"
+            );
+            let doc = document(&source, "tex");
+            for name in ["table", "tabular", "document"] {
+                let starts: Vec<_> = source
+                    .match_indices(&format!("{{{name}}}"))
+                    .map(|(at, _)| at + 1)
+                    .collect();
+                let expected: Vec<_> = starts
+                    .iter()
+                    .map(|at| doc.text.range(*at, *at + name.len()))
+                    .collect();
+                for at in starts {
+                    assert_eq!(
+                        editing::linked_editing_ranges(&doc, doc.text.position(at))
+                            .map(|linked| linked.ranges),
+                        Some(expected.clone()),
+                        "{rule}{width}: {name}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn redefined_booktabs_rule_still_consumes_its_declared_operand() {
+    for rule in ["toprule", "midrule", "bottomrule"] {
+        let source = format!(
+            "\\renewcommand{{\\{rule}}}[1]{{}}\\begin{{table}}\\begin{{tabular}}{{c}}x\\{rule}\\end{{tabular}}\\end{{table}}"
+        );
+        let doc = document(&source, "tex");
+        for name in ["table", "tabular"] {
+            for (at, _) in source.match_indices(&format!("{{{name}}}")) {
+                assert!(editing::linked_editing_ranges(&doc, doc.text.position(at + 1)).is_none());
+            }
+        }
+    }
+}
+
+#[test]
 fn nested_and_repeated_names_link_only_their_own_balanced_pair() {
     let source = r"\begin{panel}A\begin{panel}B\end{panel}C\end{panel}\begin{panel}D\end{panel}";
     let doc = document(source, "tex");

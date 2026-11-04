@@ -105,6 +105,9 @@ pub(super) fn builtin(name: &str) -> Option<Signature> {
         });
     }
     let (arguments, starred): (&[(&str, bool)], bool) = match name {
+        // Booktabs rules only read an optional width. A following environment
+        // delimiter is an independent call, even when no width is supplied.
+        "toprule" | "midrule" | "bottomrule" => (&[("width", true)], false),
         "newglossaryentry" | "DeclareAcronym" => (&[("key", false), ("fields", false)], false),
         "longnewglossaryentry" => (
             &[("key", false), ("fields", false), ("description", false)],
@@ -942,6 +945,9 @@ pub(super) fn builtin(name: &str) -> Option<Signature> {
                     | "footnotemark"
                     | "AtDataInput"
                     | "item"
+                    | "toprule"
+                    | "midrule"
+                    | "bottomrule"
                     | "printbibliography"
                     | "ExecuteBibliographyOptions"
                     | "patchcmd"
