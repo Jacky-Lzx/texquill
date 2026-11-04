@@ -60,13 +60,15 @@ impl<'a> Walk<'a> {
         linked_editing: bool,
     ) -> Self {
         let inputs = crate::project::source_inputs::Index::new(workspace, root);
-        let signatures = CommandSignatures::new(
-            workspace
-                .documents
-                .iter()
-                .filter(|(uri, doc)| scope.contains(*uri) && doc.kind == DocumentKind::Latex)
-                .map(|(_, doc)| (doc.text.source.as_str(), &doc.syntax)),
-        );
+        let documents: Vec<_> = workspace
+            .documents
+            .iter()
+            .filter(|(uri, doc)| scope.contains(*uri) && doc.kind == DocumentKind::Latex)
+            .map(|(_, doc)| (doc.text.source.as_str(), &doc.syntax))
+            .collect();
+        let signatures = CommandSignatures::new(documents.iter().copied());
+        let context =
+            CommandSignatures::source_context_with(documents.iter().copied(), &signatures);
         Self {
             workspace,
             root,
@@ -81,7 +83,15 @@ impl<'a> Walk<'a> {
                 .map(|uri| {
                     (
                         uri.clone(),
-                        source(workspace, root, uri, &signatures, &inputs, linked_editing),
+                        source(
+                            workspace,
+                            root,
+                            uri,
+                            &signatures,
+                            &context,
+                            &inputs,
+                            linked_editing,
+                        ),
                     )
                 })
                 .collect(),
@@ -368,12 +378,74 @@ fn source(
     root: &Url,
     uri: &Url,
     signatures: &CommandSignatures<'_>,
+    context: &CommandSignatures<'_>,
     inputs: &crate::project::source_inputs::Index,
     linked_editing: bool,
 ) -> Source {
     let doc = &workspace.documents[uri];
     let mut result = Source::default();
-    let mut boundaries = signatures.environment_boundaries(&doc.text.source, &doc.syntax);
+    let mut boundaries =
+        signatures.environment_boundaries_with_context(&doc.text.source, &doc.syntax, context);
+    let bodies = definition_body_spans(&doc.text.source, &doc.syntax);
+    // A balanced replacement body (e.g. a tabular cell helper) cannot consume
+    // an enclosing opener. Keep its stored delimiters uneditable, but do not
+    // make every executed environment with the same name uncertain.
+    let balanced_bodies: Vec<_> = if linked_editing {
+        bodies
+            .iter()
+            .filter(|body| {
+                boundaries
+                    .iter()
+                    .any(|boundary| body.contains(&boundary.span.start))
+            })
+            .filter(|body| {
+                if bodies
+                    .iter()
+                    .any(|inner| body.start < inner.start && inner.start < body.end)
+                {
+                    return false;
+                }
+                let mut stack = Vec::new();
+                for boundary in boundaries
+                    .iter()
+                    .filter(|boundary| body.contains(&boundary.span.start))
+                {
+                    let Some(argument) = &boundary.argument else {
+                        return false;
+                    };
+                    if boundary.operand
+                        || !boundary.direct
+                        || syntax::is_verbatim_environment(&argument.value)
+                    {
+                        return false;
+                    }
+                    if boundary.begin {
+                        stack.push(&argument.value);
+                    } else if stack.pop() != Some(&argument.value) {
+                        return false;
+                    }
+                }
+                stack.is_empty()
+                    && !doc.syntax.commands.iter().any(|command| {
+                        body.contains(&command.span.start)
+                            && (command.name.starts_with("if")
+                                || syntax::loader_extension(&command.name).is_some()
+                                || matches!(
+                                    command.name.as_str(),
+                                    "else"
+                                        | "fi"
+                                        | "IfFileExists"
+                                        | "InputIfFileExists"
+                                        | "input"
+                                        | "include"
+                                        | "endinput"
+                                ))
+                    })
+            })
+            .collect()
+    } else {
+        vec![]
+    };
     if linked_editing {
         // A change-word operation briefly leaves both linked names empty.
         // Preserve their zero-width insertion points without making empty
@@ -403,7 +475,12 @@ fn source(
     result.operations.extend(
         calls
             .iter()
-            .filter(|call| call.operand || call.deferred)
+            .filter(|call| {
+                (call.operand || call.deferred)
+                    && !balanced_bodies
+                        .iter()
+                        .any(|body| body.contains(&call.span.start))
+            })
             .map(|call| {
                 (
                     call.span.start,
@@ -475,7 +552,6 @@ fn source(
             .push((call.command.span.start, Operation::Input(target, false)));
     }
     let operands = signatures.source_argument_tokens(&doc.text.source, &doc.syntax);
-    let bodies = definition_body_spans(&doc.text.source, &doc.syntax);
     let indirect: Vec<_> = [&inputs.loaders, &inputs.checks, &inputs.selectors]
         .into_iter()
         .flat_map(|calls| calls.get(uri).into_iter().flatten())
@@ -537,9 +613,17 @@ fn source(
                         | "subfile"
                 )
             {
-                result
-                    .operations
-                    .push((command.span.start, Operation::Uncertain));
+                // Never link across a conditional edge. Independent pairs
+                // after (or wholly within) a branch can still be certified.
+                let operation = if linked_editing
+                    && (command.name.starts_with("if")
+                        || matches!(command.name.as_str(), "else" | "fi"))
+                {
+                    Operation::LinkedBarrier
+                } else {
+                    Operation::Uncertain
+                };
+                result.operations.push((command.span.start, operation));
             }
             continue;
         }

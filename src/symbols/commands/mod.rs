@@ -2555,8 +2555,20 @@ impl<'a> CommandSignatures<'a> {
         source: &str,
         parsed: &syntax::Syntax,
     ) -> Vec<EnvironmentBoundary> {
-        let operands = self.argument_tokens(source, parsed);
-        let stored = self.source_argument_tokens(source, parsed);
+        self.environment_boundaries_with_context(source, parsed, self)
+    }
+
+    /// Resolve delimiter meanings conservatively, but read operands with the
+    /// executing grammar: a nested definition must not change a later call's
+    /// argument shape before its containing macro has executed.
+    pub(crate) fn environment_boundaries_with_context(
+        &self,
+        source: &str,
+        parsed: &syntax::Syntax,
+        context: &CommandSignatures<'_>,
+    ) -> Vec<EnvironmentBoundary> {
+        let operands = context.argument_tokens(source, parsed);
+        let stored = context.source_argument_tokens(source, parsed);
         let bodies = definition_body_spans(source, parsed);
         let declarations = parsed
             .definitions

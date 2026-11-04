@@ -350,6 +350,87 @@ fn assert_project_pair(workspace: &Workspace, uri: &Url, name: &str, expected: b
 }
 
 #[test]
+fn table_pairs_survive_unrelated_style_conditionals_and_balanced_macro_bodies() {
+    let source = r"\documentclass{article}\input{style}\begin{document}
+\begin{table}[H]\centering\begin{tabular}{cc}test\end{tabular}\caption{}\label{tab:}\end{table}
+\end{document}";
+    for style in [
+        r"\ifCLASSOPTIONcompsoc\usepackage[font=normalsize]{subfig}\else\usepackage[font=footnotesize]{subfig}\fi",
+        r"\newcommand{\tabincell}[2]{\begin{tabular}{@{}#1@{}}#2\end{tabular}}",
+        r"\ifCLASSOPTIONcompsoc\usepackage{subfig}\else\usepackage{subfig}\fi
+\newcommand{\tabincell}[2]{\begin{tabular}{@{}#1@{}}#2\end{tabular}}",
+        // IEEEtran locally captures labels while rendering a caption. The
+        // doubled parameter marker belongs to that deferred definition.
+        r"\long\def\@makecaption#1#2{\def\label##1{\gdef\saved{##1}}#2}",
+    ] {
+        let (temp, workspace) = project(&[("main.tex", source), ("style.tex", style)]);
+        let uri = Url::from_file_path(temp.path().join("main.tex")).unwrap();
+        let doc = &workspace.documents[&uri];
+        for name in ["table", "tabular", "document"] {
+            let starts: Vec<_> = source
+                .match_indices(&format!("{{{name}}}"))
+                .map(|(at, _)| at + 1)
+                .collect();
+            let expected: Vec<_> = starts
+                .iter()
+                .map(|at| doc.text.range(*at, at + name.len()))
+                .collect();
+            for at in starts {
+                assert_eq!(
+                    editing::linked_editing_ranges_in_workspace(
+                        &workspace,
+                        &uri,
+                        doc.text.position(at)
+                    )
+                    .map(|linked| linked.ranges),
+                    Some(expected.clone()),
+                    "{name}: {style}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn conditional_edges_only_block_pairs_that_cross_them() {
+    for source in [
+        r"\iftrue Text\else Other\fi\begin{quote}Body\end{quote}",
+        r"\begin{quote}Body\end{quote}\iftrue Text\else Other\fi",
+        r"\iftrue\begin{quote}Body\end{quote}\else Other\fi",
+    ] {
+        let doc = document(source, "tex");
+        for (at, _) in source.match_indices("quote") {
+            assert!(
+                editing::linked_editing_ranges(&doc, doc.text.position(at)).is_some(),
+                "{source}"
+            );
+        }
+    }
+}
+
+#[test]
+fn unbalanced_or_conditional_macro_effects_still_prevent_linked_pairs() {
+    for body in [
+        r"\begin{quote}",
+        r"\end{quote}",
+        r"\begin{quote}\begin{quote}\end{quote}",
+        r"\begin{quote}\iftrue\end{quote}\fi",
+        r"\begin{quote}\input{other}\end{quote}",
+        r"\begin{quote}\usepackage{other}\end{quote}",
+        r"\def\open{\begin{quote}}\end{quote}",
+        r"\newcommand{\ignore}[1]{}\ignore{\begin{quote}}\end{quote}",
+    ] {
+        let source = format!(r"\def\helper{{{body}}}\begin{{quote}}Body\end{{quote}}");
+        let doc = document(&source, "tex");
+        let at = source.rfind("quote").unwrap();
+        assert!(
+            editing::linked_editing_ranges(&doc, doc.text.position(at)).is_none(),
+            "{body}"
+        );
+    }
+}
+
+#[test]
 fn static_named_calls_and_aliases_link_comment_bounded_environment_names() {
     for (begin, end) in [
         (r"\begin", r"\end"),
