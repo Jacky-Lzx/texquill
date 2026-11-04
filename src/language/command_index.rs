@@ -132,11 +132,22 @@ impl Fragment {
             sections: Default::default(),
             packages: packages::direct(doc),
         };
+        // A declaration inside replacement text runs when its owner is called,
+        // not while the class/package is loaded. Keep such custom names in the
+        // menu, but do not let them shadow native command completion templates.
+        let deferred =
+            crate::symbols::commands::definition_body_spans(&doc.text.source, &doc.syntax);
         for (phase, entries) in [&doc.syntax.definitions, &doc.syntax.environments]
             .into_iter()
             .enumerate()
         {
             for entry in entries {
+                if phase == 0
+                    && statics().1.names.contains_key(&entry.name)
+                    && deferred.iter().any(|span| span.contains(&entry.span.start))
+                {
+                    continue;
+                }
                 if entry.name.is_empty()
                     || !entry
                         .name

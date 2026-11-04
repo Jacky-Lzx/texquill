@@ -4582,7 +4582,8 @@ fn find_declaration<'a>(
         };
         return index
             .declaration(name, namespace)
-            .map(|declaration| declaration.map(|d| (d.uri, d.doc, d.entry)));
+            .map(|declaration| declaration.map(|d| (d.uri, d.doc, d.entry)))
+            .or_else(|()| immediate_declaration(workspace, name, environment, scope));
     }
     let mut declarations = workspace
         .documents
@@ -4600,10 +4601,57 @@ fn find_declaration<'a>(
         });
     let first = declarations.next();
     if declarations.next().is_some() {
-        Err(())
+        immediate_declaration(workspace, name, environment, scope)
     } else {
         Ok(first)
     }
+}
+
+// Replacement text does not install its nested definitions when read. Prefer
+// an immediate declaration over such deferred variants. Repeated immediate
+// declarations remain ambiguous, except for equivalent section layout wrappers.
+fn immediate_declaration<'a>(
+    workspace: &'a Workspace,
+    name: &str,
+    environment: bool,
+    scope: &BTreeSet<Url>,
+) -> Result<Option<SourceDeclaration<'a>>, ()> {
+    if environment {
+        return Err(());
+    }
+    let mut declarations = Vec::new();
+    for (uri, doc) in workspace
+        .documents
+        .iter()
+        .filter(|(uri, _)| scope.contains(*uri))
+    {
+        let deferred = definition_body_spans(&doc.text.source, &doc.syntax);
+        declarations.extend(
+            doc.syntax
+                .definitions
+                .iter()
+                .filter(|entry| {
+                    entry.name == name
+                        && !deferred.iter().any(|span| span.contains(&entry.span.start))
+                })
+                .map(|entry| (uri, doc, entry)),
+        );
+    }
+    let first = declarations.first().copied().ok_or(())?;
+    if declarations.len() > 1 {
+        for (_, doc, entry) in declarations {
+            if !matches!(
+                entry.detail.as_str(),
+                "Defined with \\def" | "Defined with \\gdef"
+            ) {
+                return Err(());
+            }
+            let at =
+                definition_arguments_start(&doc.text.source, &doc.syntax, entry, false).ok_or(())?;
+            declarations::startsection_wrapper(&doc.text.source, at, name).ok_or(())?;
+        }
+    }
+    Ok(Some(first))
 }
 
 pub(crate) fn lookup_indexed<'a>(

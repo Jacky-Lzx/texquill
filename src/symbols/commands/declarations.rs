@@ -84,6 +84,31 @@ pub(super) fn literal_argument_count(source: &str) -> Option<usize> {
     literal.trim().parse().ok()
 }
 
+/// A class can bind the six layout operands while leaving LaTeX's section
+/// reader to consume the star, optional short title and required title at use.
+/// Require an exact tail call, so a fixed title or extra replacement tokens do
+/// not turn an ordinary zero-argument macro into a title-taking command.
+pub(super) fn startsection_wrapper(source: &str, at: usize, name: &str) -> Option<Signature> {
+    let (body, _) = syntax::group(source, at, b'{', b'}')?;
+    let source = body.value.as_str();
+    let mut at = syntax::skip_space(source, 0);
+    let command = syntax::control_word(source, at)?;
+    if &source[command.clone()] != "\\@startsection" {
+        return None;
+    }
+    at = command.end;
+    for _ in 0..6 {
+        let (_, end) = syntax::group(source, syntax::skip_space(source, at), b'{', b'}')?;
+        at = end;
+    }
+    if syntax::skip_space(source, at) != source.len() {
+        return None;
+    }
+    let mut signature = builtin("section")?;
+    signature.name = name.into();
+    Some(signature)
+}
+
 pub(super) fn source_definition(
     source: &str,
     parsed: &syntax::Syntax,
@@ -310,6 +335,11 @@ pub(super) fn source_definition(
             }
             if source.as_bytes().get(i) != Some(&b'{') {
                 return None;
+            }
+            if !environment && parameters.is_empty() {
+                if let Some(signature) = startsection_wrapper(source, i, &entry.name) {
+                    return Some(signature);
+                }
             }
         }
         _ => return None,
