@@ -2240,6 +2240,7 @@ impl Syntax {
         let mut inline_tokenization = crate::symbols::commands::InlineTokenization::default();
         let mut fancyverb_context = crate::parser::fancyvrb::InlineContext::default();
         let mut raw_resource_end = 0;
+        let mut escape_codes = super::catcodes::EscapeCodes::default();
         let mut i = 0;
         while i < bytes.len() {
             // Literal conversions suppress command indexing but retain source
@@ -2258,7 +2259,7 @@ impl Syntax {
             }
             match bytes[i] {
                 b'%' if i < raw_resource_end => i += 1,
-                b'%' => {
+                b'%' if !escape_codes.is_escape(b'%') => {
                     let start = i;
                     while i < bytes.len() && bytes[i] != b'\n' {
                         i += 1;
@@ -2271,12 +2272,14 @@ impl Syntax {
                 b'{' | b'}' if punctuation_operands.contains(&i) => {
                     i += 1;
                 }
-                b'{' => {
+                b'{' if !escape_codes.is_escape(b'{') => {
+                    escape_codes.enter();
                     braces.push(i);
                     fancyverb_context.enter();
                     i += 1;
                 }
-                b'}' => {
+                b'}' if !escape_codes.is_escape(b'}') => {
+                    escape_codes.leave();
                     fancyverb_context.leave();
                     if braces.pop().is_none() {
                         result.fix(
@@ -2292,7 +2295,7 @@ impl Syntax {
                     }
                     i += 1;
                 }
-                b'\\' => {
+                escape if escape_codes.is_escape(escape) => {
                     let start = i;
                     i += 1;
                     let name_start = i;
@@ -2346,6 +2349,46 @@ impl Syntax {
                             literal_arguments.insert(argument.start, (argument.span, argument.end));
                         }
                         result.commands.push(probe);
+                        continue;
+                    }
+                    if operands_known
+                        && matches!(
+                            name,
+                            "catcode" | "begingroup" | "endgroup" | "bgroup" | "egroup"
+                        )
+                        && !inline_tokenization.contains(source, &result, &control_operands, start)
+                    {
+                        match name {
+                            "catcode" => {
+                                if let Some(assignment) =
+                                    escape_codes.assignment(source, command_end)
+                                {
+                                    let global = !assigned_controls.contains("global")
+                                        && result.commands.last().is_some_and(|previous| {
+                                            previous.name == "global"
+                                                && !control_operands.contains(&previous.span.start)
+                                                && skip_space(source, previous.span.end) == start
+                                        });
+                                    escape_codes.assign(&assignment, global);
+                                    i = assignment.end;
+                                    result.commands.push(probe);
+                                    continue;
+                                }
+                            }
+                            "begingroup" | "bgroup" => escape_codes.enter(),
+                            "endgroup" | "egroup" => escape_codes.leave(),
+                            _ => unreachable!(),
+                        }
+                    }
+                    // Honor custom escape token boundaries without interpreting
+                    // their operands with helpers that assume ordinary '\\'.
+                    if escape != b'\\' {
+                        if matches!(
+                            name,
+                            "global" | "begingroup" | "endgroup" | "bgroup" | "egroup"
+                        ) {
+                            result.commands.push(probe);
+                        }
                         continue;
                     }
                     if operands_known {

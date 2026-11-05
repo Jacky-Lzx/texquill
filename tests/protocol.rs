@@ -41798,3 +41798,45 @@ fn adjacent_push_relative_hook_labels_refresh_exact_ranges_and_providers_over_st
         server.wait_exit(0);
     }
 }
+
+#[test]
+fn literal_escape_catcodes_refresh_class_diagnostics_after_unsaved_edits() {
+    let directory = tempfile::tempdir().unwrap();
+    let uri = Url::from_file_path(directory.path().join("IEEEtran.cls")).unwrap();
+    let source = "% IEEEtran escape character definition\r\n{\\catcode`\\|=0 \\catcode`\\\\=12\r\n|xdef|@IEEEbackslash{\\}}\r\n\\def\\ordinary{Body}\r\n";
+    let mut server = Server::start();
+    server.request(1, "initialize", json!({"processId":null,"rootUri":Url::from_directory_path(directory.path()).unwrap(),"capabilities":{"textDocument":{"diagnostic":{}}},"initializationOptions":{"distribution":{"enabled":false},"build":{"onSave":false}}}));
+    server.notify("initialized", json!({}));
+    server.notify(
+        "textDocument/didOpen",
+        json!({"textDocument":{"uri":uri,"languageId":"latex","version":1,"text":source}}),
+    );
+    for (stage, tail) in ["", "{", "}", ""].into_iter().enumerate() {
+        let text = format!("{source}{tail}");
+        if stage > 0 {
+            server.notify("textDocument/didChange", json!({"textDocument":{"uri":uri,"version":stage+1},"contentChanges":[{"text":text}]}));
+        }
+        let diagnostics = server.request(
+            2 + stage as u64,
+            "textDocument/diagnostic",
+            json!({"textDocument":{"uri":uri}}),
+        );
+        let items = diagnostics["items"].as_array().unwrap();
+        if tail.is_empty() {
+            assert!(items.is_empty(), "{diagnostics}");
+        } else {
+            assert_eq!(items.len(), 1, "{diagnostics}");
+            assert_eq!(
+                items[0]["message"],
+                if tail == "{" {
+                    "Unclosed brace"
+                } else {
+                    "Unexpected closing brace"
+                }
+            );
+            let expected =
+                texquill::text::Text::new(text.clone()).range(text.len() - 1, text.len());
+            assert_eq!(items[0]["range"], serde_json::to_value(expected).unwrap());
+        }
+    }
+}
